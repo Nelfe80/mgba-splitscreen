@@ -13,6 +13,21 @@
  * to a few fps and the backlog grows unboundedly (observed: guests minutes
  * behind at 3-4 fps). A 30 fps cap keeps latency at a fraction of a second.
  *
+ * v3 raw-frame transport (2026-10-19): video frames move on a DEDICATED,
+ * UNRELIABLE, UNORDERED WebRTC DataChannel ({ordered:false, maxRetransmits:0})
+ * while input/auth/other control messages stay on the original reliable
+ * channel. Unreliable transport means a lost packet is never retransmitted:
+ * the next frame is already newer, so the guest renders the freshest picture
+ * with zero catch-up latency. Both sides drop stale frames aggressively:
+ * the host skips an encode entirely while the channel backlog isn't
+ * draining, and the guest discards any frame older than the newest decoded
+ * sequence number. Framing is a 16-byte binary header (magic, wrap-safe
+ * sequence number, dimensions, quality tier) followed by raw JPEG bytes.
+ * Encoding moved off the fast path's toDataURL/base64 detour: frames are
+ * JPEG-encoded to a Blob asynchronously (OffscreenCanvas where available)
+ * and transferred as a single ArrayBuffer, and the guest decodes with
+ * createImageBitmap instead of Blob-URL Image elements.
+ *
  * Audio: chunks are COALESCED, never dropped. The host batches ~30ms of PCM
  * into one send (instead of 60 tiny sends/s), and guests keep a bounded backlog
  * that discards the OLDEST audio when they fall behind, so a slow device hears
@@ -34,6 +49,8 @@
     videoEncoders: new Map(),
     videoLastSent: 0,
     frameBusy: false,
+    frameSeq: 0,          // monotonically increasing video frame sequence number
+    videoDropped: 0,      // host-side frames skipped while a channel was backed up
     // Audio coalescing: the pump produces ~60 chunks/s of a few KB each; we
     // batch ~30ms worth into one message instead of dropping under load.
     audioPending: null,
@@ -45,6 +62,7 @@
     videoBytes: 0,
     videoFps: 0,
     videoWindowStart: 0,
+    videoFramesDropped: 0,
   };
 
   // ~2 GBA screens' worth of raw RGBA for reference; per-seat JPEGs run 10-20KB.
@@ -53,6 +71,27 @@
   const VIDEO_MIN_INTERVAL = 1000 / VIDEO_FPS;
   const AUDIO_BATCH_MS = 30;     // coalesce window before one send
   const AUDIO_MAX_PENDING = 16384; // ~250ms of stereo s16 at 32kHz; then coalesce tail-drop;
+
+  // ---- Raw-frame video DataChannel (v3) ----
+  // Wire format: 16-byte header + raw JPEG bytes.
+  //   0..3   u32 LE magic 'FRA1' (0x46524131)
+  //   4..7   u32 LE sequence number (wraps; guest compares mod 2^32)
+  //   8..9   u16 LE frame width
+  //   10..11 u16 LE frame height
+  //   12     u8 quality tier (index into VIDEO_QUALITY_STEPS)
+  //   13..15 reserved (zero)
+  const FRAME_MAGIC = 0x46524131; // 'FRA1'
+  const FRAME_HEADER = 16;
+  const VIDEO_CHANNEL_LABEL = 'mgs-video';
+  // Quality ladder: drop JPEG quality (smaller messages) when the guest's
+  // link shows congestion, climb back when the channel is empty.
+  const VIDEO_QUALITY_STEPS = [0.55, 0.45, 0.35];
+  // While more than ~64KB (≈6-8 frames at Wi-Fi rates) sits unbuffeted in the
+  // SCTP send buffer, do not even START an encode: sending newer frames into
+  // a backed-up unreliable channel just makes the receiver drop the older
+  // ones anyway.
+  const VIDEO_BACKLOG_LIMIT = 64 * 1024;
+  const VIDEO_CALM_FRAMES = 12;  // consecutive empty-buffer sends before recovering quality
 
   function query(name) {
     try { return new URLSearchParams(window.location.search).get(name); } catch (_) { return null; }
@@ -91,6 +130,9 @@
   function removeConnection(conn) {
     state.connections = state.connections.filter((item) => item !== conn);
     state.videoEncoders.delete(conn.__player);
+    // Close the guest's video channel so the association tears down cleanly.
+    if (conn.__video) { try { conn.__video.close(); } catch (_) {} conn.__video = null; }
+    conn.__videoReady = false;
   }
 
   // ---- Per-seat JPEG video encoding ----
@@ -99,16 +141,41 @@
   // 0.55 quality is ~8-15KB, which a DataChannel moves in a few milliseconds.
   // Encoding serializes per guest: while one encode runs we keep only the
   // newest frame — we always want the freshest picture, never a stale queue.
+  // The encode is async (Blob-based, no main-thread base64 round trip) and
+  // runs on OffscreenCanvas when the browser has it.
   function encoderFor(seat) {
     let enc = state.videoEncoders.get(seat);
     if (!enc) {
-      const canvas = document.createElement('canvas');
-      canvas.width = 240;
-      canvas.height = 160;
-      enc = { canvas, ctx: canvas.getContext('2d'), busy: false, pending: null };
+      let canvas = null;
+      let ctx = null;
+      if (typeof OffscreenCanvas !== 'undefined') {
+        canvas = new OffscreenCanvas(240, 160);
+        ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+      } else {
+        canvas = document.createElement('canvas');
+        canvas.width = 240;
+        canvas.height = 160;
+        ctx = canvas.getContext('2d');
+      }
+      enc = {
+        canvas, ctx,
+        busy: false,
+        pending: null,
+        qualityIdx: 0,    // current rung on VIDEO_QUALITY_STEPS
+        calm: 0,          // consecutive empty-buffer sends (quality recovery)
+      };
       state.videoEncoders.set(seat, enc);
     }
     return enc;
+  }
+
+  // Async toBlob both avoiding (a) the toDataURL base64 string + atob byte
+  // loop and (b) the network round trip of passing through an ImageBitmap.
+  function canvasToBlob(canvas, type, quality) {
+    if (canvas.convertToBlob) return canvas.convertToBlob({ type, quality });
+    return new Promise((resolve, reject) => canvas.toBlob(
+      (blob) => blob ? resolve(blob) : reject(new Error('canvas.toBlob returned null')),
+      type, quality));
   }
 
   // GBA is 240x160 RGBA (FRAME_BYTES); GB/GBC cores produce 160x144. Anything
@@ -119,7 +186,42 @@
     return { w: 240, h: Math.max(1, Math.round(len / 4 / 240)) };
   }
 
-  function encodeAndSendFrame(conn, seat, bytes) {
+  function packFrame(seq, dims, qualityIdx, jpegBytes) {
+    const out = new Uint8Array(FRAME_HEADER + jpegBytes.byteLength);
+    const view = new DataView(out.buffer);
+    view.setUint32(0, FRAME_MAGIC, true);
+    view.setUint32(4, seq >>> 0, true);
+    view.setUint16(8, dims.w, true);
+    view.setUint16(10, dims.h, true);
+    view.setUint8(12, qualityIdx);
+    out.set(jpegBytes instanceof Uint8Array ? jpegBytes : new Uint8Array(jpegBytes), FRAME_HEADER);
+    return out.buffer;
+  }
+
+  function adaptiveQuality(enc, dc) {
+    // Recover quality only after many back-to-back empty-buffer sends; a
+    // single fast send is not evidence the link has slack again.
+    const backlogged = dc ? dc.bufferedAmount : 0;
+    if (backlogged === 0) {
+      enc.calm++;
+      if (enc.calm > VIDEO_CALM_FRAMES && enc.qualityIdx > 0) {
+        enc.qualityIdx--;
+        enc.calm = 0;
+      }
+    } else {
+      enc.calm = 0;
+    }
+  }
+
+  function hostTransport(conn) {
+    // Dedicated unreliable channel once the guest confirmed it; otherwise the
+    // reliable control channel (protocol-1 guests, channel never opened).
+    const dc = conn.__video;
+    if (dc && conn.__videoReady && dc.readyState === 'open') return { dc, seq: true };
+    return { conn, seq: false };
+  }
+
+  async function encodeAndSendFrame(conn, seat, bytes) {
     const enc = encoderFor(seat);
     if (enc.busy) {
       // An encode is running; keep only the newest frame and return.
@@ -127,7 +229,6 @@
       return;
     }
     enc.busy = true;
-    let imageBytes;
     try {
       const dims = frameDims(bytes.length);
       if (enc.canvas.width !== dims.w || enc.canvas.height !== dims.h) {
@@ -137,30 +238,42 @@
       const imgData = enc.ctx.createImageData(dims.w, dims.h);
       imgData.data.set(bytes.length > dims.w * dims.h * 4 ? bytes.subarray(0, dims.w * dims.h * 4) : bytes);
       enc.ctx.putImageData(imgData, 0, 0);
-      // toDataURL is synchronous; at 240x160 it costs ~1-2ms, acceptable on
-      // the host's frame budget at 30 fps per guest.
-      const dataUrl = enc.canvas.toDataURL('image/jpeg', 0.55);
-      imageBytes = dataUrlToBytes(dataUrl);
+      const jpeg = await canvasToBlob(enc.canvas, 'image/jpeg', VIDEO_QUALITY_STEPS[enc.qualityIdx]);
+      const jpegBuf = await jpeg.arrayBuffer();
+      const t = hostTransport(conn);
+      if (t.dc) {
+        // Drop-in-latest-frame on the SENDER: a full backlog means the guest
+        // would discard our frame for a newer one that follows anyway. Skip
+        // the send (and this frame) so the next frame starts fresh.
+        if (t.dc.bufferedAmount > VIDEO_BACKLOG_LIMIT) {
+          state.videoDropped++;
+          enc.pending = null; // the next arriving frame will encode fresh
+          return;
+        }
+        adaptiveQuality(enc, t.dc);
+        t.dc.send(packFrame(++state.frameSeq, dims, enc.qualityIdx, jpegBuf));
+      } else {
+        // Legacy reliable path: PeerJS exposes its own underlying channel.
+        // The same backlog guard applies (reliable channels can buffer
+        // unboundedly and this was the "minutes behind" failure mode).
+        const under = conn.dataChannel?.bufferedAmount;
+        if (typeof under === 'number' && under > VIDEO_BACKLOG_LIMIT) {
+          state.videoDropped++;
+          enc.pending = null;
+          return;
+        }
+        send(conn, { type: 'frame', seat, jpg: true, seq: ++state.frameSeq, data: jpegBuf });
+      }
     } catch (err) {
       console.warn('Online video encode failed:', err);
+    } finally {
       enc.busy = false;
-      return;
+      if (enc.pending) {
+        const next = enc.pending;
+        enc.pending = null;
+        encodeAndSendFrame(conn, seat, next);
+      }
     }
-    send(conn, { type: 'frame', seat, jpg: true, data: imageBytes.buffer });
-    enc.busy = false;
-    if (enc.pending) {
-      const next = enc.pending;
-      enc.pending = null;
-      encodeAndSendFrame(conn, seat, next);
-    }
-  }
-
-  function dataUrlToBytes(dataUrl) {
-    const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
-    const bin = atob(base64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return bytes;
   }
 
   function guestCount() {
@@ -211,6 +324,17 @@
         players: guestCount(),
       });
       report(`Online host: Player ${player + 1} joined (${state.connections.length} guest${state.connections.length === 1 ? '' : 's'})`);
+      // The authenticated connection is live: start the separate video
+      // peer negotiation (offer flows to the guest over this channel).
+      setupVideoPeer(conn);
+      return;
+    }
+    if (message.type === 'video-answer') {
+      hostVideoAnswer(conn, message.sdp);
+      return;
+    }
+    if (message.type === 'video-ice') {
+      hostVideoIce(conn, message.data);
       return;
     }
     if (message.type === 'input' && Number.isInteger(conn.__player)) {
@@ -261,6 +385,73 @@
     queueMicrotask(() => { state.frameBusy = false; });
   }
 
+  // v3: the dedicated UNRELIABLE, UNORDERED DataChannel for raw video frames
+  // lives on its OWN RTCPeerConnection, negotiated through the reliable
+  // control channel (hello/welcome/input/audio stay on PeerJS untouched).
+  // Inside PeerJS's managed connection we must NOT add channels: adding one
+  // to an established connection renegotiates the association PeerJS relies
+  // on, and both A/B attempts (host-created post-open, guest-created
+  // pre-offer) wedged one direction of the control channel in turn. With the
+  // separate peer connection there is no renegotiation of anything PeerJS
+  // manages: control and video fail independently. Unordered + zero
+  // retransmits is the point: a lost or stale packet is never retransmitted,
+  // so the guest always renders the freshest frame, and the host skips
+  // sends while the backlog is high instead of queueing. The video peer is
+  // best-effort: if its negotiation fails the host keeps sending per-seat
+  // frames over the reliable channel (protocol-1-compatible fallback).
+  const VIDEO_ICE = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+  function setupVideoPeer(conn) {
+    try {
+      if (conn.__video) return;
+      const pc = new RTCPeerConnection({ iceServers: VIDEO_ICE });
+      const dc = pc.createDataChannel(VIDEO_CHANNEL_LABEL, { ordered: false, maxRetransmits: 0 });
+      dc.binaryType = 'arraybuffer';
+      conn.__videoPc = pc;
+      conn.__video = dc;
+      conn.__videoIcePending = [];
+      dc.onopen = () => { conn.__videoReady = true; };
+      dc.onclose = () => { if (conn.__video === dc) conn.__video = null; };
+      pc.onicecandidate = (event) => {
+        if (event.candidate) send(conn, { type: 'video-ice', data: JSON.stringify(event.candidate) });
+      };
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed' && conn.__video === dc) conn.__video = null;
+      };
+      pc.createOffer()
+        .then((offer) => pc.setLocalDescription(offer))
+        .then(() => send(conn, { type: 'video-offer', sdp: pc.localDescription.sdp }))
+        .catch((err) => console.warn('Online host video negotiation failed:', err));
+    } catch (err) {
+      console.warn('Online host video peer unavailable:', err);
+    }
+  }
+
+  function hostVideoAnswer(conn, sdp) {
+    const pc = conn.__videoPc;
+    if (!pc || !sdp) return;
+    pc.setRemoteDescription({ type: 'answer', sdp })
+      .then(() => {
+        for (const cand of conn.__videoIcePending.splice(0)) {
+          pc.addIceCandidate(cand).catch((err) => console.warn('Late video ICE rejected:', err));
+        }
+      })
+      .catch((err) => console.warn('Online host video answer failed:', err));
+  }
+
+  function hostVideoIce(conn, raw) {
+    try {
+      const cand = JSON.parse(raw);
+      const pc = conn.__videoPc;
+      if (!pc) return;
+      if (!pc.remoteDescription) {
+        conn.__videoIcePending.push(cand);
+        return;
+      }
+      pc.addIceCandidate(cand).catch((err) => console.warn('Video ICE rejected:', err));
+    } catch (_) { /* malformed trickle; the channel can still come up */ }
+  }
+
   function setupHostConnection(conn) {
     conn.on('open', () => report('Online host: guest connected; authenticating…'));
     conn.on('data', (message) => hostMessage(conn, message));
@@ -283,15 +474,14 @@
       state.callbacks.guestSeat?.(message.player);
       report(`Online guest: connected as Player ${message.player + 1}`);
     } else if (message.type === 'frame' && message.data) {
+      // Legacy fallback path (channel not confirmed; protocol-1 semantics):
+      // the reliable channel's frames decode the same way, tagged with the
+      // sequence the host attached (ordering is guaranteed there, so a
+      // seq-less protocol-1 host simply never stale-drops).
       const bytes = message.data instanceof ArrayBuffer
         ? new Uint8Array(message.data)
         : new Uint8Array(message.data.buffer || message.data);
-      if (message.jpg) {
-        // Per-seat JPEG: decode and hand the guest's single screen raw pixels.
-        decodeJpegFrame(bytes);
-      } else {
-        state.callbacks.frame?.(bytes);
-      }
+      decodeGuestVideoLegacy(bytes, Number(message.seq));
     } else if (message.type === 'audio' && message.data) {
       // Tagged audio chunk (u32 LE rate + interleaved stereo s16), same format
       // the desktop WebSocket streams. Guests play it through the same
@@ -300,51 +490,183 @@
         ? new Uint8Array(message.data)
         : new Uint8Array(message.data.buffer || message.data);
       state.callbacks.audio?.(bytes);
+    } else if (message.type === 'video-offer') {
+      setupGuestVideoPeer(message.sdp);
+    } else if (message.type === 'video-ice') {
+      guestVideoIce(message.data);
     } else if (message.type === 'error') {
       report(`Online guest: ${message.message || 'host rejected the connection'}`);
     }
   }
 
-  // Per-seat JPEG: decode asynchronously, then blit. Decoding serializes so a
-  // burst of frames never stacks dozens of pending Image objects.
-  const guestDecoder = { busy: false, pending: null };
-  function decodeJpegFrame(jpegBytes) {
-    if (guestDecoder.busy) {
-      guestDecoder.pending = jpegBytes;
-      return;
+  // The guest's own RTCPeerConnection for the dedicated video channel —
+  // separate from PeerJS's managed peer connection on purpose (see the
+  // comment on setupVideoPeer for why).
+  let guestVideoPc = null;
+  let guestVideoIcePending = [];
+
+  function setupGuestVideoPeer(sdp) {
+    try {
+      if (!sdp) return;
+      if (guestVideoPc) { try { guestVideoPc.close(); } catch (_) {} guestVideoPc = null; }
+      const pc = new RTCPeerConnection({ iceServers: VIDEO_ICE });
+      guestVideoPc = pc;
+      pc.ondatachannel = (event) => {
+        if (event.channel && event.channel.label === VIDEO_CHANNEL_LABEL) guestVideoChannel(event.channel);
+      };
+      pc.onicecandidate = (event) => {
+        if (event.candidate) send(state.host, { type: 'video-ice', data: JSON.stringify(event.candidate) });
+      };
+      guestVideoIcePending = [];
+      pc.setRemoteDescription({ type: 'offer', sdp })
+        .then(() => {
+          for (const cand of guestVideoIcePending.splice(0)) {
+            pc.addIceCandidate(cand).catch((err) => console.warn('Late video ICE rejected:', err));
+          }
+          return pc.createAnswer();
+        })
+        .then((answer) => pc.setLocalDescription(answer))
+        .then(() => send(state.host, { type: 'video-answer', sdp: pc.localDescription.sdp }))
+        .catch((err) => console.warn('Online guest video negotiation failed:', err));
+    } catch (err) {
+      console.warn('Online guest video peer unavailable:', err);
     }
-    guestDecoder.busy = true;
-    const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
-    const url = URL.createObjectURL(blob);
-    const img = new Image();
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      // Windowed fps for the videoStats() probe: cheap and self-resetting.
-      const now = performance.now();
-      if (!state.videoWindowStart || now - state.videoWindowStart >= 1000) {
-        state.videoWindowStart = now;
-        state.videoFps = 0;
-      }
-      state.videoFrames++;
-      state.videoBytes += jpegBytes.length;
-      state.videoFps++;
-      state.callbacks.frame?.({ jpeg: img });
-      guestDecoder.busy = false;
-      if (guestDecoder.pending) {
-        const next = guestDecoder.pending;
-        guestDecoder.pending = null;
-        decodeJpegFrame(next);
-      }
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      guestDecoder.busy = false;
-      guestDecoder.pending = null;
-    };
-    img.src = url;
   }
 
+  function guestVideoIce(raw) {
+    try {
+      const cand = JSON.parse(raw);
+      if (!guestVideoPc) { guestVideoIcePending.push(cand); return; }
+      if (!guestVideoPc.remoteDescription) { guestVideoIcePending.push(cand); return; }
+      guestVideoPc.addIceCandidate(cand).catch(() => {});
+    } catch (_) { /* malformed trickle; the channel can still come up */ }
+  }
 
+  // v3 guest video: frames arrive on the dedicated unreliable data channel as
+  // raw binary (16-byte header + JPEG). Unreliable/unordered transport means
+  // EVERY packet's delay is unrecoverable by design — the freshest frame is
+  // always right behind a stale one — so the decoder keeps only ONE pending
+  // slot and overwrites it with any newer sequence number that arrives. A
+  // frame is decoded strictly in newest-first order; anything out of order or
+  // older than the last DELIVERED frame is dropped without work.
+  const guestDecoder = {
+    busy: false,
+    pending: null,           // { seq, w, h, payload } still undecoded
+    deliveredSeq: 0,         // newest blitted frame; never dropped older than this
+  };
+
+  // True unless seq is "older" than ref on the 2^32 wraparound ring.
+  function seqIsNewer(seq, ref) {
+    const d = (seq - ref) >>> 0;
+    return d !== 0 && d < 0x80000000;
+  }
+
+  function imageDecode(job) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(new Blob([job.payload], { type: 'image/jpeg' }));
+      const img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Image decode failed')); };
+      img.src = url;
+    });
+  }
+
+  function guestVideoChannel(channel) {
+    channel.binaryType = 'arraybuffer';
+    channel.onmessage = (event) => {
+      const data = event.data;
+      if (data instanceof ArrayBuffer) {
+        guestVideoMessage(new Uint8Array(data));
+      } else if (ArrayBuffer.isView(data)) {
+        guestVideoMessage(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+      }
+    };
+  }
+
+  function guestVideoMessage(bytes) {
+    if (bytes.length < FRAME_HEADER) return;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, FRAME_HEADER);
+    if (view.getUint32(0, true) !== FRAME_MAGIC) return;
+    const seq = view.getUint32(4, true);
+    const w = view.getUint16(8, true);
+    const h = view.getUint16(10, true);
+    const payload = bytes.subarray(FRAME_HEADER);
+    if (payload.length === 0) return;
+    guestVideoJob({ seq, w, h, payload });
+  }
+
+  // Legacy reliable-path frames become the same decoded job, tagged with the
+  // sequence carried in the message (absent for protocol-1 hosts -> never
+  // stale-drop, ordering is already guaranteed on the reliable channel).
+  function decodeGuestVideoLegacy(jpegBytes, seq) {
+    if (!jpegBytes.length) return;
+    const dims = frameDims(jpegBytes.length);
+    guestVideoJob({
+      seq: Number.isInteger(seq) ? seq >>> 0 : 0,
+      w: dims.w, h: dims.h,
+      payload: jpegBytes,
+    });
+  }
+
+  function guestVideoJob(job) {
+    // Drop-old-frames: an unordered channel can deliver a stale frame after
+    // a fresh one. The seq != 0 guard makes protocol-1 (seq-less) frames
+    // alwaysDecode; deliveredSeq == 0 means no frame decoded yet.
+    if (job.seq !== 0 && guestDecoder.deliveredSeq !== 0 &&
+        !seqIsNewer(job.seq, guestDecoder.deliveredSeq)) {
+      state.videoFramesDropped++;
+      return;
+    }
+    // A decode may be in flight; keep ONLY the newest pending frame.
+    if (guestDecoder.pending &&
+        !seqIsNewer(job.seq, guestDecoder.pending.seq)) {
+      state.videoFramesDropped++;
+      return;
+    }
+    guestDecoder.pending = job;
+    if (!guestDecoder.busy) decodeGuestVideo();
+  }
+
+  async function decodeGuestVideo() {
+    if (guestDecoder.busy) return;
+    guestDecoder.busy = true;
+    try {
+      let job = guestDecoder.pending;
+      while (job) {
+        guestDecoder.pending = null;
+        // decodeBitmap is createImageBitmap where available (async, GPU-
+        // friendly, no DOM image element); older browsers fall back to the
+        // object-URL Image path this used to use exclusively.
+        const bmp = await (typeof createImageBitmap === 'function'
+          ? createImageBitmap(new Blob([job.payload], { type: 'image/jpeg' }))
+          : imageDecode(job));
+        guestDecoder.deliveredSeq = job.seq || guestDecoder.deliveredSeq;
+        // Windowed fps for the videoStats() probe: cheap and self-resetting.
+        const now = performance.now();
+        if (!state.videoWindowStart || now - state.videoWindowStart >= 1000) {
+          state.videoWindowStart = now;
+          state.videoFps = 0;
+        }
+        state.videoFrames++;
+        state.videoBytes += job.payload.length;
+        state.videoFps++;
+        state.callbacks.frame?.({ jpeg: bmp, width: job.w, height: job.h });
+        // The receiver holds the newest bitmap only: if a newer frame landed
+        // while this decode ran, discard our bitmap and decode ahead.
+        const next = guestDecoder.pending;
+        if (next) { bmp.close?.(); job = next; continue; }
+        job = null;
+        // Bitmap stays alive for main.js's next rAF blit (it closes it after
+        // drawing — ImageBitmaps hold GPU memory).
+        break;
+      }
+    } catch (err) {
+      console.warn('Online guest video decode failed:', err);
+    } finally {
+      guestDecoder.busy = false;
+      if (guestDecoder.pending) decodeGuestVideo();
+    }
+  }
 
   function setupGuestConnection(conn) {
     state.host = conn;
@@ -353,7 +675,7 @@
         type: 'hello',
         token: fragment('token') || query('token'),
         player: Number(fragment('player') || query('player')),
-        protocol: 1,
+        protocol: 2,
       });
       report('Online guest: connecting to host…');
     });
@@ -446,14 +768,14 @@
         state.peer.on('open', () => { clearTimeout(timer); resolve(); });
         state.peer.on('error', (err) => { clearTimeout(timer); reject(err); });
       });
-      state.host = state.peer.connect(peerId, { reliable: true });
-      state.host.on('open', () => {
-        send(state.host, { type: 'hello', token, player, protocol: 1 });
-        report('Online guest: connecting to host…');
-      });
-      state.host.on('data', guestMessage);
-      state.host.on('close', () => report('Online guest: host disconnected'));
-      state.host.on('error', (err) => report(`Online guest: ${err.message || 'connection failed'}`));
+      const conn = state.peer.connect(peerId, { reliable: true });
+      state.host = conn;
+      // setupGuestConnection owns the hello + control wiring; its open
+      // handler reads the same URL values validated above, so no second
+      // hello here (two hellos would trip the host's already-connected
+      // rejection and close the connection). Reuse the SAME connection —
+      // connecting twice would open a parallel session and split the wire.
+      setupGuestConnection(conn);
     } catch (err) {
       state.role = 'idle';
       report(`Online unavailable: ${err.message || err}`);
@@ -531,6 +853,17 @@
     guestCount: () => state.connections.length,
     invite: () => buildInvite(1),
     // Guest AV health probe (crash reporter / manual debugging).
-    videoStats: () => ({ frames: state.videoFrames, bytes: state.videoBytes, fps: state.videoFps }),
+    videoStats: () => ({
+      frames: state.videoFrames,
+      bytes: state.videoBytes,
+      fps: state.videoFps,
+      dropped: state.videoFramesDropped,
+    }),
+    // Host probe: how each connected guest's video is transported
+    // (true = dedicated unreliable v3 channel confirmed; false = legacy
+    // reliable control-channel frames).
+    videoChannels: () => state.connections.map((conn) => ({
+      unreliable: !!(conn.__video && conn.__videoReady),
+    })),
   };
 })();
