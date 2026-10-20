@@ -84,6 +84,9 @@ struct Player {
 static struct mStandardLogger g_logger;
 static bool g_logger_ready = false;
 
+static void collect_audio(void); /* defined with the audio section, below */
+static void reset_audio_streams(void);
+
 /* Install the logger if needed and set its filter level. mgs_init always wants
  * the silent defaults, but must NOT clobber a level mgs_enable_debug() already
  * raised (call order isn't guaranteed), so force=false only installs the first
@@ -283,6 +286,7 @@ void mgs_init(int count) {
 	memset(g_players, 0, sizeof(g_players));
 	memset(g_asleep, 0, sizeof(g_asleep));
 	memset(g_last_fc, 0, sizeof(g_last_fc));
+	reset_audio_streams();
 	if (g_has_coord) {
 		GBASIOLockstepCoordinatorDeinit(&g_coord);
 		g_has_coord = false;
@@ -467,13 +471,18 @@ void mgs_run_frame(void) {
 			for (unsigned x = 0; x < p->width; ++x) {
 				uint32_t px = v[y * MAX_W + x];
 				size_t j = (size_t)y * p->width + x;
-				out[j * 4 + 0] = (uint8_t)(px & 0xFF);
-				out[j * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
-				out[j * 4 + 2] = (uint8_t)((px >> 16) & 0xFF);
-				out[j * 4 + 3] = 0xFF;
-			}
+			out[j * 4 + 0] = (uint8_t)(px & 0xFF);
+			out[j * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+			out[j * 4 + 2] = (uint8_t)((px >> 16) & 0xFF);
+			out[j * 4 + 3] = 0xFF;
 		}
 	}
+
+	/* Collect this frame's produced audio NOW: after a catch-up burst the
+	 * cores' 2048-frame rings would otherwise overflow before the JS pump's
+	 * next mgs_get_audio call (it reads the collected streams instead). */
+	collect_audio();
+}
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -525,6 +534,54 @@ void mgs_set_keys(int player, uint32_t keys) {
 static int16_t g_mix[AUDIO_MAX_FRAMES * 2];
 static int g_mix_frames = 0;
 static int16_t g_tmp[AUDIO_MAX_FRAMES * 2];
+/* Per-player collected-audio streams (interleaved stereo s16, consumed by
+ * mgs_get_audio; see the long note above for why these exist). */
+#define AUDIO_STREAM_FRAMES 8192 /* ~500ms at 32768 Hz; oldest half dropped when full */
+static int16_t g_astream[MAX_PLAYERS][AUDIO_STREAM_FRAMES * 2];
+static size_t g_astream_used[MAX_PLAYERS];   /* total frames currently buffered */
+static size_t g_astream_head[MAX_PLAYERS];   /* consumed offset into the buffer */
+
+/* Drains each core's produced audio into its per-player stream. Runs after
+ * every stepped frame (see the collection note above for why per-frame). */
+static void collect_audio_player(int i) {
+	struct Player* p = &g_players[i];
+	if (!p->running) {
+		return;
+	}
+	struct mAudioBuffer* buf = p->core->getAudioBuffer(p->core);
+	if (!buf) {
+		return;
+	}
+	/* Occupied region of the stream is [head, head + used). */
+	size_t read;
+	while ((read = mAudioBufferRead(buf, g_tmp, AUDIO_MAX_FRAMES)) > 0) {
+		if (g_astream_head[i] + g_astream_used[i] + read > AUDIO_STREAM_FRAMES) {
+			size_t drop = g_astream_head[i] + g_astream_used[i] + read - AUDIO_STREAM_FRAMES;
+			if (drop > g_astream_used[i]) {
+				drop = g_astream_used[i];
+			}
+			const size_t kept = g_astream_used[i] - drop;
+			if (kept > 0) {
+				memmove(g_astream[i], g_astream[i] + (g_astream_head[i] + drop) * 2, kept * 2 * sizeof(int16_t));
+			}
+			g_astream_head[i] = 0;
+			g_astream_used[i] = kept;
+		}
+		memcpy(g_astream[i] + (g_astream_head[i] + g_astream_used[i]) * 2, g_tmp, read * 2 * sizeof(int16_t));
+		g_astream_used[i] += read;
+	}
+}
+
+static void collect_audio(void) {
+	for (int i = 0; i < g_count; ++i) {
+		collect_audio_player(i);
+	}
+}
+
+static void reset_audio_streams(void) {
+	memset(g_astream_used, 0, sizeof(g_astream_used));
+	memset(g_astream_head, 0, sizeof(g_astream_head));
+}
 /* Audio routing, mirroring the desktop Audio menu: 0 = mute, 1-4 = that
  * player's whole mix (music + SFX together — the core can't split them),
  * 5 = blend all players (default, so in-browser play hears everyone). */
@@ -549,7 +606,8 @@ EMSCRIPTEN_KEEPALIVE
 int16_t* mgs_get_audio(void) {
 	g_mix_frames = 0;
 	if (g_audio_source == 0) {
-		/* Muted: drain nothing, output silence. */
+		/* Muted: nothing is handed to the JS pump. Streams still collect
+		 * (mgs_run_frame) and self-bound via their oldest-aware cap. */
 		return g_mix;
 	}
 	if (g_audio_source >= 1 && g_audio_source <= 4) {
@@ -558,19 +616,21 @@ int16_t* mgs_get_audio(void) {
 		if (i >= g_count || !g_players[i].running) {
 			return g_mix;
 		}
-		struct mAudioBuffer* buf = g_players[i].core->getAudioBuffer(g_players[i].core);
-		if (!buf) {
+		size_t used = g_astream_used[i] - g_astream_head[i];
+		if (used == 0) {
 			return g_mix;
 		}
-		size_t avail = mAudioBufferAvailable(buf);
-		if (avail > AUDIO_MAX_FRAMES) {
-			avail = AUDIO_MAX_FRAMES;
+		if (used > AUDIO_MAX_FRAMES) {
+			used = AUDIO_MAX_FRAMES; /* g_mix capacity; leftover is NOT dropped */
 		}
-		size_t read = mAudioBufferRead(buf, g_mix, avail);
-		g_mix_frames = (int) read;
+		memcpy(g_mix, g_astream[i] + g_astream_head[i] * 2, used * 2 * sizeof(int16_t));
+		g_astream_head[i] += used;
+		g_mix_frames = (int) used;
 		return g_mix;
 	}
-	/* Mix all players (default). */
+	/* Mix all players (default). Every consumed player advances by the SAME
+	 * number of frames so the mix stays time-aligned across cores, even after
+	 * a player slept through part of a catch-up burst. */
 	int running = 0;
 	size_t best = AUDIO_MAX_FRAMES;
 	for (int i = 0; i < g_count; ++i) {
@@ -579,20 +639,13 @@ int16_t* mgs_get_audio(void) {
 			continue;
 		}
 		++running;
-		struct mAudioBuffer* buf = p->core->getAudioBuffer(p->core);
-		if (!buf) {
-			continue;
-		}
-		size_t avail = mAudioBufferAvailable(buf);
-		if (avail < best) {
-			best = avail;
+		size_t used = g_astream_used[i] - g_astream_head[i];
+		if (used < best) {
+			best = used;
 		}
 	}
 	if (running == 0 || best == 0) {
 		return g_mix;
-	}
-	if (best > AUDIO_MAX_FRAMES) {
-		best = AUDIO_MAX_FRAMES;
 	}
 	/* First running player seeds the mix; the rest sum in (with clamp). */
 	bool seeded = false;
@@ -601,19 +654,16 @@ int16_t* mgs_get_audio(void) {
 		if (!p->running) {
 			continue;
 		}
-		struct mAudioBuffer* buf = p->core->getAudioBuffer(p->core);
-		if (!buf) {
-			continue;
-		}
-		size_t read = mAudioBufferRead(buf, g_tmp, best);
+		const int16_t* src = g_astream[i] + g_astream_head[i] * 2;
 		if (!seeded) {
-			memcpy(g_mix, g_tmp, read * 2 * sizeof(int16_t));
+			memcpy(g_mix, src, best * 2 * sizeof(int16_t));
 			seeded = true;
 		} else {
-			for (size_t j = 0; j < read * 2; ++j) {
-				g_mix[j] = clamp16((int32_t) g_mix[j] + g_tmp[j]);
+			for (size_t j = 0; j < best * 2; ++j) {
+				g_mix[j] = clamp16((int32_t) g_mix[j] + src[j]);
 			}
 		}
+		g_astream_head[i] += best;
 	}
 	g_mix_frames = (int) best;
 	return g_mix;
