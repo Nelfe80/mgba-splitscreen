@@ -206,6 +206,7 @@
   }
 
   function fileIssue(report) {
+    if (!AUTO_FILING) { showCrashOverlay(report, false); return; }
     const url = issueUrl(report);
     // Persist both the report and the ready-to-open issue URL so the rescue
     // page (or a later manual visit) can file without this tab being alive.
@@ -368,6 +369,10 @@
     if (reason && (reason.name === 'AbortError')) return; // user-cancelled pickers
     reportError('Unhandled promise rejection', String((reason && reason.message) || reason || '(no reason)'), reason);
   }, true);
+
+  // Dev-only opt-out so local testing never redirects a tab into a GitHub
+  // sign-in mid-session (?crashreport=0 suppresses auto-filing everywhere).
+  const AUTO_FILING = urlParam('crashreport') !== '0';
 
   // The WASM runtime calls this on abort (OOM, assertion, unhandled trap).
   window.mgbaCrash = {

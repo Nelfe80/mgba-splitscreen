@@ -3,6 +3,79 @@
 > Ordered by priority within each section. **Aggressively append results to
 > `history.md` as you work** so the next session can pick up mid-thought.
 
+## 🟢 2026-10-20 (3) — Controller-only joins (phones-as-gamepads)
+
+- [x] **Shipped + verified live**: Online → "Host as Controllers" emits
+      ?pad=1 invites; pad guests render their touch pad, forward input over
+      the control channel, and receive zero video/audio (host skips
+      video-peer setup + broadcastFrame/flushAudio for them). Verified:
+      input flowed (P2 WarioWare cursor moved from the pad guest's RIGHT).
+      Seat-assignment quirk fixed (pad welcome still fires guestSeat —
+      press() refuses unassigned guests).
+- [x] **Crash-report opt-out**: ?crashreport=0 suppresses auto-filing
+      (the window.open race redirect-bombed new tabs during testing).
+- [ ] **HUMAN retest with a phone**: desk-test a pad guest for feel (latency
+      of input only — no video decode cost), then confirm a REAL phone joins
+      over LAN/WAN the same way. If good: commit+push (audio/WASM commit,
+      UI commit, this feature in whichever is cleaner), Pages picks all up.
+
+## 🟢 2026-10-20 (2) — Audio garble fix + sharper video + portrait split + touch layouts
+
+- [x] **Audio garble root-caused and fixed in the engine**: the cores' 2048-
+      frame mAudioBuffer rings overflowed on every ≥2-frame rAF (catch-up or
+      turbo), overwriting queued samples — garble baked into the stream, so
+      host AND guests heard it. `mgs_run_frame` now collects each frame's
+      audio into per-player streams; `mgs_get_audio` mixes the streams with
+      cross-player alignment. Verified zero loss over a 6-frame forced burst
+      (2048+1246 delivered = all 3294 produced). WASM rebuilt (emcc 6.0.8).
+- [x] **Sharper video**: host encoder prefers WebP (webp@0.8 ≈ 8.8KB vs
+      jpeg@0.55 ≈ 7.5KB, no chroma mush on pixel art); jpeg fallback ladder
+      kept for old Safari. Part of the same WASM/shell refresh (SW → v10).
+- [x] **Portrait split**: game top half / opaque controls panel bottom half
+      (`@media portrait` + `:has()` gate), landscape keeps the floating
+      overlay. Guest verified at 390×844 (canvas 0–404, controls 440–844).
+- [x] **Touch layout editor**: ✎ Layout chip → drag buttons anywhere, tap to
+      cycle 0.75×/1×/1.4×/2×, persisted per ROM stem (MKSC example verified:
+      2× RIGHT saved under `mksc`, default restored on other ROMs, back again).
+- [ ] **HUMAN retest**: same laptop+phone session as before with power saver
+      OFF — audio should be clean on both ends (this fix changes engine
+      output, the thing both devices consume), video visibly sharper on the
+      phone, portrait should show the split. Reload the PWA twice (or clear
+      the SW) so v10 lands.
+- [ ] Then commit/push: audio+WASM is one commit, UI (portrait/layouts/webp
+      shell) is the other; Pages redeploy picks it up.
+
+## 🟢 2026-10-20 — Post-deploy perf audit: "emulator struggling to keep frames"
+
+- [x] **Memory ruled out (measured, live 2-tab session)**: host JS heap
+      flat ~261-267MB over 60s (drift −4MB, no growth, no GC sawtooth); guest
+      heap flat 8MB across 38 samples while decoding 168 frames / 933KB of
+      video (0 drops) — ImageBitmaps are closed after blit, no bitmap/Blob
+      leak; wasm heap is FIXED at 256MB (`ALLOW_MEMORY_GROWTH=0`), cannot
+      grow; audio buffers bounded (coalesced host batches ≤ ~250MB? no — 16KB
+      tail-drop, guest keeps ≤ ~0.5s with oldest-drop).
+- [x] **Root cause of the frame stutter = CPU cost per frame, throttled by
+      power settings** (not memory, not the v3 video path, not the lockstep
+      coordinator): per `_mgs_run_frame()` on the same machine, same ROM
+      (WarioWare, 2P): 9-11ms when the CPU is at full speed (~60fps ceiling),
+      22-38ms under battery saver (≤ 26fps). Engine can't beat the 16.6ms/
+      frame budget when the governor clamps — and guests' browsers also
+      throttle rAF hard when their tab is backgrounded/occluded (~1-2Hz).
+      Lockstep overhead measured ~zero (2P 22.4ms vs 1P 11.8ms ⇒ 2×~11ms is
+      pure core cost; stats: 12 sleeps/13 wakes/frame).
+- [x] **Tried SIMD+LTO (autovectorized PPU) — no measurable gain, reverted**:
+      `-msimd128 -flto` rebuild measured 9.79ms vs 9.42ms baseline in
+      back-to-back A/B rounds; binary grew 789KB → 916KB. Branchy PPU just
+      doesn't vectorize. Keeping the simple build (HEAD's build.sh/wasm).
+- [ ] **HUMAN retest WITH power saver OFF on laptop AND phone**: frame feel
+      should now hold near 60fps on desktop; phone needs its tab foregrounded
+      (screen on) or it rAF-throttles to ~1fps regardless — that's browser
+      policy, not the app. If 2P still dips below 60fps on AC power, next
+      levers are threaded cores (`-pthread` + Workers) or a native-render.
+- [ ] Left running for the retest: local server `python3 -m http.server
+      8125` (serves mgba-splitscreen/src). Join URLs: start host → Online
+      menu; QR (or copy the URL) from the phone on the same network.
+
 ## 🟢 2026-10-19 — Online video v3 (raw unreliable frames) + issue #2 save fix
 
 - [x] **v3 raw-frame transport SHIPPED + wire-verified** (details:

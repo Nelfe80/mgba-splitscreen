@@ -22,7 +22,8 @@
  * the host skips an encode entirely while the channel backlog isn't
  * draining, and the guest discards any frame older than the newest decoded
  * sequence number. Framing is a 16-byte binary header (magic, wrap-safe
- * sequence number, dimensions, quality tier) followed by raw JPEG bytes.
+ * sequence number, dimensions, quality tier) followed by raw WebP or JPEG
+ * bytes (the host picks WebP when its browser can encode it).
  * Encoding moved off the fast path's toDataURL/base64 detour: frames are
  * JPEG-encoded to a Blob asynchronously (OffscreenCanvas where available)
  * and transferred as a single ArrayBuffer, and the guest decodes with
@@ -78,14 +79,20 @@
   //   4..7   u32 LE sequence number (wraps; guest compares mod 2^32)
   //   8..9   u16 LE frame width
   //   10..11 u16 LE frame height
-  //   12     u8 quality tier (index into VIDEO_QUALITY_STEPS)
+  //   12     u8 quality tier (index into the codec's ladder)
   //   13..15 reserved (zero)
   const FRAME_MAGIC = 0x46524131; // 'FRA1'
   const FRAME_HEADER = 16;
   const VIDEO_CHANNEL_LABEL = 'mgs-video';
-  // Quality ladder: drop JPEG quality (smaller messages) when the guest's
-  // link shows congestion, climb back when the channel is empty.
-  const VIDEO_QUALITY_STEPS = [0.55, 0.45, 0.35];
+  // Quality ladder. The encoder prefers WebP — at a similar byte size it
+  // keeps pixel-art edges far sharper than JPEG, whose 4:2:0 chroma
+  // subsampling smears GBA-style flat-color edges every 2px. Browsers that
+  // can't encode WebP (Safari before 14.1) fall back to JPEG at its own
+  // ladder. Measured at 240x160 on a real GBA frame: webp@0.8 ≈ 8.8KB vs
+  // jpeg@0.55 ≈ 7.5KB — the sharper choice costs little extra bandwidth,
+  // and the backlog guard below bounds total throughput anyway.
+  const VIDEO_WEBP_STEPS = [0.8, 0.65, 0.5];
+  const VIDEO_JPEG_STEPS = [0.75, 0.6, 0.45];
   // While more than ~64KB (≈6-8 frames at Wi-Fi rates) sits unbuffeted in the
   // SCTP send buffer, do not even START an encode: sending newer frames into
   // a backed-up unreliable channel just makes the receiver drop the older
@@ -161,7 +168,8 @@
         canvas, ctx,
         busy: false,
         pending: null,
-        qualityIdx: 0,    // current rung on VIDEO_QUALITY_STEPS
+        blobType: null,   // null = undetermined; first encode resolves webp/jpeg
+        qualityIdx: 0,    // current rung on the ladder
         calm: 0,          // consecutive empty-buffer sends (quality recovery)
       };
       state.videoEncoders.set(seat, enc);
@@ -238,7 +246,19 @@
       const imgData = enc.ctx.createImageData(dims.w, dims.h);
       imgData.data.set(bytes.length > dims.w * dims.h * 4 ? bytes.subarray(0, dims.w * dims.h * 4) : bytes);
       enc.ctx.putImageData(imgData, 0, 0);
-      const jpeg = await canvasToBlob(enc.canvas, 'image/jpeg', VIDEO_QUALITY_STEPS[enc.qualityIdx]);
+      let blobType = enc.blobType || 'image/webp';
+      const steps = blobType === 'image/jpeg' ? VIDEO_JPEG_STEPS : VIDEO_WEBP_STEPS;
+      let jpeg;
+      try {
+        jpeg = await canvasToBlob(enc.canvas, blobType, steps[Math.min(enc.qualityIdx, steps.length - 1)]);
+      } catch (err) {
+        // This browser can't encode the preferred type (e.g. WebP): fall back
+        // permanently to JPEG. The guest decodes whatever bytes arrive.
+        blobType = 'image/jpeg';
+        enc.blobType = blobType;
+        jpeg = await canvasToBlob(enc.canvas, blobType, VIDEO_JPEG_STEPS[Math.min(enc.qualityIdx, VIDEO_JPEG_STEPS.length - 1)]);
+      }
+      if (!enc.blobType) enc.blobType = jpeg.type === 'image/webp' ? 'image/webp' : 'image/jpeg';
       const jpegBuf = await jpeg.arrayBuffer();
       const t = hostTransport(conn);
       if (t.dc) {
@@ -285,6 +305,7 @@
       player,
       expires: invite.expires,
       consumed: invite.consumed,
+      pad: !!invite.pad,
       url: invite.consumed ? null : buildInvite(player),
     }));
   }
@@ -314,6 +335,12 @@
       invite.consumed = true;
       invite.token = null;
       conn.__player = player;
+      // Controller-only guests (built with ?pad=1 invites) drive their seat
+      // but receive no video/audio: they render a touch controller and
+      // forward input like any other guest, without consuming the host's
+      // video encode or their own data budget. Nothing else changes — input
+      // already rides the reliable control channel.
+      conn.__padOnly = message.pad === true || message.pad === 'true';
       state.connections.push(conn);
       publishInvites();
       state.callbacks.inviteUsed?.(player);
@@ -322,11 +349,13 @@
         session: state.session,
         player,
         players: guestCount(),
+        padOnly: !!conn.__padOnly,
       });
-      report(`Online host: Player ${player + 1} joined (${state.connections.length} guest${state.connections.length === 1 ? '' : 's'})`);
+      report(`Online host: Player ${player + 1} joined${conn.__padOnly ? ' (controller only)' : ''} (${state.connections.length} guest${state.connections.length === 1 ? '' : 's'})`);
       // The authenticated connection is live: start the separate video
-      // peer negotiation (offer flows to the guest over this channel).
-      setupVideoPeer(conn);
+      // peer negotiation. A controller-only guest skips it entirely (no
+      // video offer → no video peer → no frames ever sent to this conn).
+      if (!conn.__padOnly) setupVideoPeer(conn);
       return;
     }
     if (message.type === 'video-answer') {
@@ -366,6 +395,9 @@
     for (const conn of state.connections) {
       const guestSeat = conn.__player;
       if (!Number.isInteger(guestSeat)) continue;
+      // Controller-only guests sent nothing on the video path at all —
+      // guard here (this is the per-frame hot loop) and in removeConnection.
+      if (conn.__padOnly) continue;
       let bytes = null;
       if (typeof source === 'function') {
         bytes = source(guestSeat);
@@ -466,6 +498,19 @@
     if (!message || typeof message !== 'object') return;
     if (message.type === 'welcome') {
       state.assignedPlayer = message.player;
+      // Controller-only guests (welcome.padOnly, set from the host's ?pad=1
+      // invite set) skip the player/view setup entirely: main.js keeps the
+      // full chrome hidden, touch shows the pad, and no video/audio arrives.
+      state.padOnly = message.padOnly === true;
+      state.callbacks.padGuest?.(state.padOnly);
+      if (state.padOnly) {
+        // The pad must know its seat even though there is no screen view:
+        // touch press() gates on guestSeat being assigned (unassigned
+        // guests inject nothing), so a pad-only welcome still assigns it.
+        state.callbacks.guestSeat?.(message.player);
+        report(`Online guest: connected as Player ${message.player + 1} (controller only)`);
+        return;
+      }
       // Guests render exactly ONE screen (their own seat). The host's `players`
       // count describes its local grid; `seat` tells the guest which slice of
       // the old concatenated format it used to receive — with per-seat JPEG
@@ -676,6 +721,7 @@
         token: fragment('token') || query('token'),
         player: Number(fragment('player') || query('player')),
         protocol: 2,
+        pad: query('pad') === '1' || query('pad') === 'true',
       });
       report('Online guest: connecting to host…');
     });
@@ -694,6 +740,7 @@
     url.searchParams.set('peer', state.peer.id);
     url.searchParams.set('player', String(player));
     url.searchParams.set('players', String(guestCount()));
+    if (invite.pad) url.searchParams.set('pad', '1');
     const rom = query('rom');
     if (rom) url.searchParams.set('rom', rom);
     // Keep bearer data in the fragment: browsers do not send it in referrers.
@@ -706,22 +753,26 @@
     return url.href;
   }
 
-  function createInvites() {
+  function createInvites(padOnly) {
     state.invites = new Map();
     const expires = Date.now() + 10 * 60 * 1000;
     for (let player = 1; player < guestCount(); player++) {
-      state.invites.set(player, { token: randomToken(), expires, consumed: false });
+      state.invites.set(player, { token: randomToken(), expires, consumed: false, pad: !!padOnly });
     }
   }
 
-  async function startHost() {
+  // padOnly: build controller-only invites (phones-as-controllers). Mixed
+  // sessions are a deliberate non-goal: one host emits one invite set, so a
+  // host wanting both kinds re-runs "Host as Controller Invites" after a
+  // screen-invite set expires. Keeps the invite model dead simple.
+  async function startHost(padOnly) {
     const needsFresh = state.role === 'host' && [...state.invites.values()].every((invite) =>
       invite.consumed || Date.now() >= invite.expires);
     if (state.role === 'host' && needsFresh) {
       state.session = randomToken(8);
-      createInvites();
+      createInvites(padOnly);
       publishInvites();
-      report('Online host: issued fresh invites for all guest slots');
+      report(padOnly ? 'Controller invites refreshed' : 'Online host: issued fresh invites for all guest slots');
       return buildInvite(1);
     }
     if (state.role !== 'idle') return buildInvite(1);
@@ -729,7 +780,7 @@
       const Peer = peerConstructor();
       state.role = 'host';
       state.session = randomToken(8);
-      createInvites();
+      createInvites(padOnly);
       state.peer = new Peer();
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('PeerJS broker timeout')), 10000);
@@ -738,7 +789,9 @@
       });
       state.peer.on('connection', setupHostConnection);
       publishInvites();
-      report('Online host ready — one invite is available for each guest slot');
+      report(padOnly
+        ? 'Controller host ready — phones join as controllers only (no video sent to them)'
+        : 'Online host ready — one invite is available for each guest slot');
       return buildInvite(1);
     } catch (err) {
       state.role = 'idle';
@@ -831,7 +884,10 @@
     let off = 4;
     for (const c of state.audioPending) { merged.set(c, off); off += c.length; }
     state.audioPending = [];
-    for (const conn of state.connections) send(conn, { type: 'audio', data: merged.buffer });
+    for (const conn of state.connections) {
+      if (conn.__padOnly) continue; // controller-only guests hear nothing
+      send(conn, { type: 'audio', data: merged.buffer });
+    }
     queueMicrotask(() => { state.audioBusy = false; });
   }
 
@@ -852,6 +908,9 @@
     assignedPlayer: () => state.assignedPlayer,
     guestCount: () => state.connections.length,
     invite: () => buildInvite(1),
+    // True when this guest joined a controller-only (?pad=1) invite set:
+    // it renders the pad and forwards input; the host sends no video/audio.
+    isPadGuest: () => state.padOnly === true,
     // Guest AV health probe (crash reporter / manual debugging).
     videoStats: () => ({
       frames: state.videoFrames,

@@ -68,6 +68,7 @@
         <summary>Online<span class="beta-badge">beta</span></summary>
         <div class="menu-items" id="online-menu">
           <button id="online-host">Host Online Session</button>
+          <button id="online-host-pad">Host as Controllers</button>
           <label class="online-slot-label" for="online-slot">Guest slot</label>
           <select id="online-slot" disabled>
             <option value="1">Player 2</option>
@@ -76,7 +77,7 @@
           <button id="online-copy-all" disabled>Copy All Invite URLs</button>
           <button id="online-show-qr" disabled>Show QR Code</button>
           <button id="online-share" disabled>Share Invite&#8230;</button>
-          <div id="online-status" class="menu-note">BETA: play over the internet with friends. Hosting keeps emulation (and the ROM) on this device. Crashes auto-file a GitHub issue to help us fix them.</div>
+          <div id="online-status" class="menu-note">BETA: play over the internet with friends. Hosting keeps emulation (and the ROM) on this device. Crashes auto-file a GitHub issue to help us fix them. "Host as Controllers": phones join as gamepads only — no video is sent to them, so local players can play on the big screen with phones in hand.</div>
         </div>
       </details>
 
@@ -237,6 +238,7 @@
         <button type="button" class="touch-btn touch-shoulder" data-btn="L" aria-label="L shoulder">L</button>
         <div class="touch-top-center">
           <button type="button" class="touch-btn touch-pause" data-action="pause" aria-label="Pause menu">&#8942;</button>
+          <button type="button" id="touch-edit" class="touch-edit-chip" data-action="edit" aria-label="Customize touch layout" aria-pressed="false">&#9998; Layout</button>
           <div id="touch-note" class="touch-note"></div>
           <div id="touch-player-picker" class="touch-player-picker"></div>
         </div>

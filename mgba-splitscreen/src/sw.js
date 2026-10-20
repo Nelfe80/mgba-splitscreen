@@ -1,12 +1,15 @@
 // Bump whenever the shell file list or their cached contents change, or
-// installed PWAs keep serving the stale shell forever. v9: online v3
-// raw-frame video (dedicated unreliable DataChannel on its own
+// installed PWAs keep serving the stale shell forever. v10: per-frame audio
+// collection in the engine (fixes catch-up burst garble), sharper video
+// ladder (WebP when the browser encodes it), portrait controls split, and
+// the per-ROM touch layout editor. Prior:
+// v9: online v3 raw-frame video (dedicated unreliable DataChannel on its own
 // RTCPeerConnection, async Blob JPEG encode, ImageBitmap decode with
 // drop-stale frames). Prior: Hide Menu / Full Screen mode (F11) (v8 was a
 // v3-in-progress intermediate — history.md has the story); crash overlay +
 // in-app issue reporting (v6); guest streaming v2 (per-seat JPEG, guest
 // chrome hidden, coalesced audio).
-const CACHE = 'mgba-splitscreen-shell-v9';
+const CACHE = 'mgba-splitscreen-shell-v10';
 const SHELL = [
   './',
   './index.html',

@@ -216,6 +216,8 @@ async function loadRomFromUrl(url) {
     recordRecent(stem, null, null, key);
   }
   setStatus(ok ? `Running: ${stem}` : 'Error: ROM load failed in browser engine');
+  // Per-game touch-control layouts follow the loaded ROM (see touch-controls.js).
+  if (ok) { try { window.mgbaTouch?.setRom?.(stem); } catch (_) {} }
   return ok;
 }
 
@@ -744,12 +746,12 @@ function onlineJoinRequested() {
   return urlParam('online') === 'join' && !!urlParam('peer');
 }
 
-async function startOnlineHost() {
+async function startOnlineHost(padOnly) {
   if (!window.mgbaOnline) {
     setOnlineStatus('PeerJS is unavailable; check the network or Content-Security-Policy.');
     return;
   }
-  const invite = await window.mgbaOnline.startHost();
+  const invite = await window.mgbaOnline.startHost(padOnly);
   if (!invite) return;
   // The online layer publishes the complete per-slot set through its callback;
   // this fallback keeps P2 usable if an older online.js is cached.
@@ -1857,6 +1859,7 @@ async function loadGamePath(path, name, boxArtPath) {
   await invoke('load_rom', { path });
   resetRuntimeState();
   setStatus(`Running: ${name}`);
+  try { window.mgbaTouch?.setRom?.(name); } catch (_) {}
   recordRecent(name, path, boxArtPath);
   closeLibrary();
 }
@@ -1868,6 +1871,7 @@ async function loadGameFile(file, name) {
     const ok = wasmLoadRomBytes(bytes) === 0;
     if (ok) resetRuntimeState();
     setStatus(ok ? `Running: ${name}` : 'Error: ROM load failed in browser engine');
+    if (ok) { try { window.mgbaTouch?.setRom?.(name); } catch (_) {} }
     let key = null;
     if (ok) {
       key = `rom_${name}`;
@@ -2066,6 +2070,7 @@ async function startGameWithPlayers(n) {
         const ok = wasmLoadRomBytes(cached.bytes) === 0;
         if (ok) resetRuntimeState();
         setStatus(ok ? `Running: ${g.name}` : 'Error: ROM load failed');
+        if (ok) { try { window.mgbaTouch?.setRom?.(g.name); } catch (_) {} }
       } else {
         const resp = await fetch('/load_rom', { method: 'POST', body: cached.bytes });
         if (resp.ok) resetRuntimeState();
@@ -3452,9 +3457,13 @@ window.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('import-state').addEventListener('click', () =>
     IS_TAURI ? importStateTauri() : importStateBrowser());
   document.getElementById('toggle-solo').addEventListener('click', toggleSoloKeyboard);
-  document.getElementById('online-host').addEventListener('click', () => {
+  // online-host-pad post-dates the first deployed shells; a warm PWA can run
+  // fresh JS against an old cached index.html — null-guard each binding so a
+  // stale shell degrades to "button missing" instead of killing all of boot.
+  const hostPadBtn = document.getElementById('online-host-pad');
+  if (hostPadBtn) hostPadBtn.addEventListener('click', () => {
     closeMenus();
-    startOnlineHost();
+    startOnlineHost(true);
   });
   document.getElementById('online-slot').addEventListener('change', (event) => {
     selectOnlineSlot(event.target.value);
@@ -3504,6 +3513,14 @@ window.addEventListener('DOMContentLoaded', async () => {
       audio: onAudio, // guests play the host's streamed mix (tagged rate + s16)
       input: (player, keys) => setKeys(player + 1, keys),
       guestSeat: (seat) => { if (window.mgbaTouch) window.mgbaTouch.setGuest(seat); },
+      // Controller-only guest (?pad=1 invite): the phone is a gamepad. Force
+      // the touch overlay on immediately and keep the full menu chrome —
+      // there is no game view to protect, and Start/Select/pause live there.
+      padGuest: (padOnly) => {
+        if (!padOnly || !window.mgbaTouch) return;
+        window.mgbaTouch.forceOn();
+        document.body.classList.remove('guest-session');
+      },
       invites: (descriptors) => {
         updateOnlineInvites(descriptors);
         const button = document.getElementById('online-copy-invite');

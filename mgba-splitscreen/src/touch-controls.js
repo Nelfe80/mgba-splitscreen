@@ -25,6 +25,15 @@
   };
 
   const MODE_KEY = 'mgba-splitscreen_touch_v1';
+  /* Custom layouts: per-ROM (or 'default') map of data-btn ->
+   * { x, y, s } — x/y are percentage coordinates of the pad area (0-100,
+   * centered on the button), s is a scale factor applied on top of the CSS
+   * size. Edit mode (the pencil chip) lets a thumb drag buttons anywhere and
+   * tap them to cycle 0.75x / 1x / 1.4x / 2x. Reason: different games want
+   * different pads — e.g. Mario Kart Super Circuit is mostly LEFT/RIGHT, so
+   * enlarging those two helps enormously without touching other games. */
+  const LAYOUT_KEY = 'mgba-splitscreen_touch_layout_v1';
+  const SIZE_STEPS = [0.75, 1, 1.4, 2];
   const MAX_PLAYERS = 4;
 
   const state = {
@@ -39,7 +48,14 @@
     mode: 'auto',        // 'auto' | 'on' | 'off'
     touchSeen: false,    // a real touch input happened at least once
     guestSeat: null,     // set when the magic-link guest is welcomed
+    forced: false,       // controller-only guest: pad always on
     awaitingGuest: false, // ?online=join seen but welcome not yet received
+    editMode: false,     // layout editor active
+    edits: {},           // currently applied layout map (per-ROM profile)
+    romName: 'default',  // profile key; set by main.js when a ROM loads
+    dragPid: null,       // pointerId captured during a drag
+    dragBtn: null,
+    dragMoved: false,
   };
 
   function loadMode() {
@@ -58,6 +74,7 @@
   }
 
   function shouldShow() {
+    if (state.forced) return true;
     if (state.mode === 'on') return true;
     if (state.mode === 'off') return false;
     return state.touchSeen || state.guestSeat !== null
@@ -121,8 +138,111 @@
     return el && el.closest ? el.closest('[data-btn]') : null;
   }
 
+  // ---- Layout editor: drag to place, tap to cycle size, per-ROM persisted ----
+  function layoutPath() {
+    try { return JSON.parse(localStorage.getItem(LAYOUT_KEY) || '{}'); } catch (_) { return {}; }
+  }
+
+  function saveLayout(all) {
+    try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(all)); } catch (_) {}
+  }
+
+  function applyLayout() {
+    if (!state.root) return;
+    for (const el of state.root.querySelectorAll('.touch-btn')) {
+      const name = el.dataset.btn;
+      const conf = name ? state.edits[name] : null;
+      if (conf) {
+        el.classList.add('touch-custom');
+        el.style.left = conf.x + '%';
+        el.style.top = conf.y + '%';
+        el.style.transform = `translate(-50%, -50%) scale(${conf.s || 1})`;
+      } else {
+        el.classList.remove('touch-custom');
+        el.style.left = el.style.top = el.style.transform = '';
+      }
+    }
+  }
+
+  function toggleEditMode() {
+    if (!state.root) return;
+    state.editMode = !state.editMode;
+    state.root.classList.toggle('editing', state.editMode);
+    const chip = document.getElementById('touch-edit');
+    if (chip) {
+      chip.setAttribute('aria-pressed', String(state.editMode));
+      chip.classList.toggle('active', state.editMode);
+    }
+    if (state.editMode) {
+      state.edits = layoutPath()[state.romName] || {};
+      applyLayout();
+      state.callbacks.onStatus?.(`Touch layout editing (for ${state.romName}); drag a button, tap to resize, or tap Done`);
+    } else {
+      applyLayout();
+      state.callbacks.onStatus?.('Touch layout editing done');
+    }
+  }
+
+  function clampPct(v) { return Math.max(4, Math.min(96, v)); }
+
+  function editPointerDown(e, el) {
+    state.dragPid = e.pointerId;
+    state.dragBtn = el.dataset.btn;
+    state.dragMoved = false;
+    try { state.root.setPointerCapture(e.pointerId); } catch (_) {}
+  }
+
+  function editPointerMove(e) {
+    if (e.pointerId !== state.dragPid || !state.dragBtn) return;
+    e.preventDefault();
+    const rect = state.root.getBoundingClientRect();
+    const conf = state.edits[state.dragBtn] || (state.edits[state.dragBtn] = { x: 50, y: 50, s: 1 });
+    conf.x = clampPct(((e.clientX - rect.left) / rect.width) * 100);
+    conf.y = clampPct(((e.clientY - rect.top) / rect.height) * 100);
+    state.dragMoved = true;
+    applyOne(state.dragBtn);
+  }
+
+  function editPointerUp(e) {
+    if (e.pointerId !== state.dragPid) return;
+    const btn = state.dragBtn;
+    state.dragPid = null;
+    if (!btn) return;
+    if (!state.dragMoved) {
+      // A tap (no drag) cycles the button's size.
+      const conf = state.edits[btn] || (state.edits[btn] = { x: 50, y: 50, s: 1 });
+      const cur = SIZE_STEPS.indexOf(conf.s || 1);
+      conf.s = SIZE_STEPS[(cur + 1 + SIZE_STEPS.length) % SIZE_STEPS.length] ?? SIZE_STEPS[0];
+      applyOne(btn);
+    }
+    try {
+      const all = layoutPath();
+      all[state.romName] = state.edits;
+      saveLayout(all);
+    } catch (_) {}
+    state.dragBtn = null;
+  }
+
+  function applyOne(name) {
+    const el = state.root.querySelector(`[data-btn="${name}"]`);
+    const conf = state.edits[name];
+    if (!el || !conf) return;
+    el.classList.add('touch-custom');
+    el.style.left = conf.x + '%';
+    el.style.top = conf.y + '%';
+    el.style.transform = `translate(-50%, -50%) scale(${conf.s || 1})`;
+  }
+
   function onPointerDown(e) {
     if (!state.root || state.root.hidden) return;
+    if (state.editMode) {
+      const target = e.target.closest ? e.target.closest('[data-btn]') : null;
+      if (target) {
+        e.preventDefault();
+        editPointerDown(e, target);
+      }
+      return; // no gameplay input while editing
+    }
     const target = e.target.closest ? e.target.closest('[data-btn]') : null;
     if (!target) return;
     e.preventDefault();
@@ -132,6 +252,7 @@
   }
 
   function onPointerMove(e) {
+    if (state.editMode) { editPointerMove(e); return; }
     if (!state.pointers.has(e.pointerId)) return;
     e.preventDefault();
     const hit = buttonAt(e.clientX, e.clientY);
@@ -146,6 +267,7 @@
   }
 
   function onPointerUp(e) {
+    if (state.editMode) { editPointerUp(e); return; }
     if (!state.pointers.has(e.pointerId)) return;
     e.preventDefault();
     const btn = state.pointers.get(e.pointerId);
@@ -165,6 +287,11 @@
     if (pauseBtn) {
       pauseBtn.addEventListener('pointerdown', (e) => e.preventDefault());
       pauseBtn.addEventListener('click', () => state.callbacks.onPause?.());
+    }
+    const editBtn = document.getElementById('touch-edit');
+    if (editBtn) {
+      editBtn.addEventListener('pointerdown', (e) => e.preventDefault());
+      editBtn.addEventListener('click', toggleEditMode);
     }
     if (state.picker) {
       state.picker.addEventListener('click', (e) => {
@@ -220,6 +347,8 @@
           state.picker.appendChild(b);
         }
       }
+      try { state.edits = layoutPath()[state.romName] || {}; } catch (_) { state.edits = {}; }
+      applyLayout();
       bindEvents();
       setModeLabel();
       updatePicker();
@@ -250,6 +379,12 @@
       updatePicker();
       updateVisibility(); // magic-link arrival (or host fallback) re-evaluates
     },
+    // Controller-only guests (phone-as-gamepad) always show the pad: that is
+    // the whole point of their session. Does not change the persisted mode.
+    forceOn() {
+      state.forced = true;
+      updateVisibility();
+    },
     cycleMode() {
       state.mode = state.mode === 'auto' ? 'on' : state.mode === 'on' ? 'off' : 'auto';
       saveMode();
@@ -259,6 +394,16 @@
         state.mode === 'auto' ? 'Touch controls: auto (shows on touch devices and guests)'
           : state.mode === 'on' ? 'Touch controls: always shown'
           : 'Touch controls: hidden');
+    },
+    // main.js calls this once a ROM is running so per-game layouts switch
+    // automatically (e.g. bigger LEFT/RIGHT for Mario Kart Super Circuit).
+    setRom(name) {
+      const next = name || 'default';
+      if (state.romName === next) return;
+      state.romName = next;
+      try { state.edits = layoutPath()[next] || {}; } catch (_) { state.edits = {}; }
+      if (state.editMode) toggleEditMode(); // leave edit mode on a game switch
+      applyLayout();
     },
     maskFor(player) {
       return state.masks[player] || 0;

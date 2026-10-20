@@ -612,6 +612,68 @@ body {
 }
 .touch-controls[hidden] { display: none; }
 
+/* ---- Layout editor (per-ROM custom touch layout) ---- */
+/* A customized button escapes its grid into absolute placement against the
+   control layer's box (its rect is exactly the drag/coordinate space). */
+.touch-btn.touch-custom {
+  position: absolute;
+} /* left/top/scale come from inline styles written by touch-controls.js */
+.touch-edit-chip {
+  pointer-events: auto;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 999px;
+  background: rgba(30, 30, 34, 0.6);
+  color: #cfd6dd;
+  font: 600 0.62rem/1 system-ui, sans-serif;
+  padding: 4px 10px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.touch-edit-chip.active {
+  background: #24c8db;
+  border-color: #24c8db;
+  color: #06262a;
+}
+/* While editing: make every control visibly rearrangeable. */
+.touch-controls.editing .touch-btn {
+  outline: 1px dashed rgba(36, 200, 219, 0.8);
+  outline-offset: 2px;
+  cursor: move;
+}
+/* While editing, never show the pressed scale animation: dragging a button
+   should move its inline transform, not fling it toward scale(0.94). */
+.touch-controls.editing .touch-btn.pressed {
+  background: rgba(36, 40, 46, 0.55);
+}
+
+/* Portrait devices: park the controls in a dedicated BOTTOM HALF instead of
+   floating them over the game. A floating overlay is the right ergonomics in
+   landscape (thumbs reach the bottom corners of a centered 3:2 tile); in
+   portrait the game is tall and letterboxed, so overlaying pads on it covers
+   real pixels. `:has()` scopes this to when controls are actually visible
+   (guest tiles, or after the first touch) so the game regains the full area
+   when they are off. Menubar is a fixed 36px; the split is computed from it. */
+@media (orientation: portrait) {
+  body:has(.touch-controls:not([hidden])) .screen-container {
+    flex: 0 0 auto;
+    height: calc((100vh - 36px) / 2);
+  }
+  body:has(.touch-controls:not([hidden])) .touch-controls {
+    top: auto;
+    bottom: 0;
+    height: calc((100vh - 36px) / 2);
+    background: #101014;
+    border-top: 1px solid #26262c;
+    box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.55);
+    justify-content: center; /* center the pad clusters vertically */
+  }
+  /* Landscape keeps the floating overlay; guests in portrait with a keyboard
+     pair still see the split only if the layer is visible. */
+  .touch-controls {
+    z-index: 250; /* unchanged but explicit for the split layout */
+  }
+}
+
 .touch-btn {
   pointer-events: auto;
   border: none;

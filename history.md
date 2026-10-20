@@ -8,6 +8,143 @@
 
 ---
 
+## 2026-10-20 (3) — Controller-only joins (phones-as-gamepads, the "cabinetcast" idea)
+
+**Verdict: shipped and verified end to end on a live session — "Host as
+Controllers" emits ?pad=1 invites; such guests render their touch pad on a
+black-canvas-less full page and forward input over the existing control
+channel; the host skips video negotiation and audio sends toward them
+entirely. Not committed yet.**
+
+- **Design**: one host emits ONE invite set (mixed screen+pad sessions are a
+  deliberate non-goal — re-run "Host as Controllers" to switch modes). The
+  invite URL carries `?pad=1` in search params (public intent), never a
+  bearer change; hello carries `pad:true`, welcome carries `padOnly:true`.
+- **Host** (`online.js hostMessage/broadcastFrame/flushAudio`): pads are
+  still first-class player connections in `state.connections`; the only
+  differences are `setupVideoPeer()` skipped, `broadcastFrame`'s hot loop
+  `continue`s past them, and `flushAudio` skips them — a pad guest costs
+  the host ~nothing. Status text notes "(controller only)".
+- **Guest** (`guestMessage` welcome path): `padOnly` guests skip the
+  screen-view rebuild entirely BUT still fire `guestSeat` (touch press()
+  gates on the seat being assigned — found this live: input refused until
+  setGuest ran). `main.js padGuest` forces the touch overlay on
+  (`mgbaTouch.forceOn()`) and removes `body.guest-session` so the menus
+  (pause/pad chips) work; there is no game view to protect.
+- **UI**: Online menu gains "Host as Controllers" (`online-host-pad`); its
+  bindings are null-guarded because warm PWAs can run fresh JS against a
+  stale cached shell (that exact mismatch WAS a real boot-killer caught by
+  our own auto-crash-reporter mid-test).
+- **Crash reporter opt-out**: `?crashreport=0` (crash-report.js AUTO_FILING)
+  — the auto-filer's window.open race hijacked new-tab navigation to a
+  GitHub sign-in during testing; testers can now suppress that without
+  touching code. The report overlay still renders; only external filing
+  is suppressed.
+- **Live proof**: host tab (2 players, ROM running) + pad guest tab joined
+  via ?pad=1 URL: guest reported "connected as Player 2 (controller only)",
+  pad rendered, RIGHT press synthesized `sendInput(p=1, keys=16)` and the
+  host's P2 WarioWare title cursor moved while held (screenshots).
+- **SW shell stays v10** (same file set; this is a shell-content change only
+  for deploy testers who already re-fetch).
+
+---## 2026-10-20 (2) — Audio garble root-caused + fixed; sharper video; portrait split; touch layout editor
+
+**Verdict: garble was an engine defect — the 2048-frame mAudioBuffer ring
+overflowed whenever the emulator ran ≥2 game frames per rAF. Fixed by
+collecting audio per stepped frame into per-player streams; verified zero
+sample loss across a 6-frame catch-up burst. Video now WebP; portrait
+devices get a controls-bottom-half split; per-ROM touch layouts added. Not
+committed yet.**
+
+- **Audio bug** (this explains "garbled on both host laptop and phone" — the
+  corruption was baked into the stream, not per-device): `mgs_get_audio` read
+  the cores' `mAudioBuffer` rings ONLY when the JS pump called it, but the
+  ring holds 2048 frames (~3.75 frames of 32kHz audio) while the frontend's
+  fixed-timestep loop runs up to 6 frames per rAF under catch-up (and turbo
+  runs 4). Every 2+ frame rAF: the ring wraps and OVERWRITES queued samples,
+  permanently pinning the ring (probe: pumps constant 2048 forever). Host and
+  guests both heard chunk-overwritten garbage.
+- **The fix** (`web/mgba_splitscreen_web.c`): `mgs_run_frame` now calls
+  `collect_audio()` after every stepped frame, draining each core's ring into
+  per-player `g_astream` buffers (8192 frames each, oldest-half dropped if
+  the JS side stalls). `mgs_get_audio` mixes from the streams — all players
+  advance by the SAME frame count (time-aligned across cores even after a
+  sleep/catch-up) instead of the old availability-alignment. WASM rebuilt.
+  Verified: paused → dry the streams → 6-frame forced burst → pumps returned
+  [2048, 1246, 0...] = all 3294 produced frames delivered (old code lost the
+  overflow, [2048, 0...]).
+- **Knock-on**: `wasmPumpAudio`'s drain ordering still matches (it reads the
+  streams via the same `mgs_get_audio`); turbo still skips nothing (streams
+  self-bound).
+- **Video sharpness**: encoder now prefers **WebP**: measured on a real
+  frame, webp@0.8 = 8.8KB with crisp pixel-art edges vs jpeg@0.55 = 7.5KB
+  with chroma-subsample mush; ladder webp [0.8, 0.65, 0.5], jpeg fallback
+  [0.75, 0.6, 0.45] for browsers without WebP encode (old Safari). Note the
+  same encode call in a fresh tab measured ~1000ms for jpeg vs ~10ms webp —
+  first-call cost; steady-state per-frame encode is fast (<30ms).
+- **Portrait split** (`styles.css`, `@media (orientation: portrait)` +
+  `body:has(.touch-controls:not([hidden]))`): the game gets the top half
+  (height calc((100vh - 36px)/2)) and the touch layer becomes an opaque
+  #101014 panel occupying the bottom half. Landscape keeps the floating
+  overlay (verified: layer bg stays transparent, game full-viewport height).
+  Guest verified at 390×844: canvas 0–404px, controls 440–844px.
+- **Touch layout editor** (`touch-controls.js` + the ✎ Layout chip):
+  per-ROM profiles in localStorage (`mgba-splitscreen_touch_layout_v1`, key
+  = ROM stem from `mgbaTouch.setRom(name)`, called on every load path
+  incl. ?rom= and library relaunch). Edit mode: drag any pad button
+  anywhere (pointer-captured, % coords of the layer), tap (no drag) cycles
+  size 0.75×/1×/1.4×/2×, saved on every gesture end. Verified on MKSC:
+  RIGHT resized to 2× and moved (persisted under key `mksc`), reverted to
+  56px default on `setRom('test')`, restored to 42px (2×) on `setRom('mksc')`.
+- **SW shell bumped → v10** (deployed PWAs refetch the new engine + shell).
+
+---
+## 2026-10-20 — "Emulator struggling to keep frames" diagnosis (power mode, not memory/v3)
+
+**Verdict: the reported frame slump on the user's laptop/phone is CPU
+per-frame cost throttled by power settings — not memory growth, not the v3
+video path, not the lockstep coordinator. Memory disconfirmed by direct
+measurement; SIMD+LTO tried and reverted (no gain); bottleneck is the
+software PPU under a throttled CPU.**
+
+Measured during a live 2-tab session (host tab + guest tab joined via the
+v3 unreliable channel, real ROM, localhost server on 8125):
+- **Host JS heap FLAT**: 261→267MB, 60 one-second samples of plain running
+  (drift −4MB, no one-directional growth, no GC sawtooth).
+  The wasm domain heap is FIXED 256MB (build.sh `-sALLOW_MEMORY_GROWTH=0`)
+  so it cannot fill either.
+- **Guest JS heap FLAT**: 8MB across 38 samples while decoding 168 frames
+  / 933KB of video with 0 drops → ImageBitmaps ARE closed after blit, Blob
+  decode garbage is reclaimed; nothing accumulates.
+- **Audio paths are bounded**: host coalesce window cap 16384B (~250ms,
+  oldest-chunk tail-drop); guests keep ≤ ~0.5s and drop the OLDEST audio
+  when over cap (main.js onAudio merge), so neither side can balloon.
+- **Per-frame `_mgs_run_frame()` cost, same machine+ROM (WarioWare, 2
+  players)**: 9.4-11.8ms median whenever the CPU was at full speed; 22-38ms
+  median while battery saver was on (user reported they had it on). The
+  16.6ms/frame budget for 2P needs the fast state; the slow state caps at
+  ~26fps, i.e. exactly "struggling to keep frames at speed".
+- **Lockstep coordinator exonerated**: 2P costs 22.4ms vs 1P 11.8ms on the
+  same tab back-to-back → pure 2× core cost; coordinator adds ~1ms and its
+  per-frame stats show only ~12 sleeps / 13 wakes (steady rendezvous, no
+  spinning); (_steps=2192, cycles=562016 = exactly 2 frameCycles for both
+  cores).
+- **Guest "slowness" on a phone is largely browser policy**: a backgrounded
+  or occluded tab gets rAF throttled to ~1Hz (measured here: 1.2-1.5s
+  between frames with ZERO long tasks), and Chrome keeps throttling because
+  the compositor isn't updating — unrelated to engine cost.
+- **SIMD+LTO experiment (build.sh `-msimd128 -flto`, emcc 6.0.8)**: built
+  and re-measured back-to-back against the HEAD binary: 9.79ms vs 9.42ms
+  (4 periods of 60 paused frames each) — inside noise. Branch-heavy GBA PPU
+  autovectorization doesn't bite; binary grew 789→916KB. REVERTED: keep the
+  simple `-O3` build with NO SIMD/LTO flags.
+- **Next levers if 2P still misses 60fps under full power**: threaded cores
+  (`build.sh` currently sets `-DUSE_PTHREADS=OFF` — the fork's lockstep is
+  cooperative, so one Worker per player plus a SharedArrayBuffer budget is
+  the big change; measure first), or mGBA's cached-scanline PPU path.
+
+---
+
 ## 2026-10-19 (1) — Online video v3: dedicated unreliable DataChannel + drop-stale frames
 
 **Verdict: shipped and wire-verified with a live 2-tab host/guest session on
