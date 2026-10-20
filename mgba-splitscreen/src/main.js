@@ -1340,7 +1340,9 @@ let renderScheduled = false;
 // The old behavior built the host's full N-screen grid from welcome{players},
 // which showed every guest more than they should see. The host now sends the
 // guest's own seat as per-seat JPEG; frames arrive as {jpeg: HTMLImageElement}
-// and blit straight onto the single canvas.
+// (legacy reliable path) or {jpeg: ImageBitmap, width, height} (v3 raw-frame
+// DataChannel) and blit straight onto the single canvas. Paid attention to
+// decode-freshness: online.js only delivers the NEWEST decoded frame here.
 function applyGuestSeatView() {
   if (!window.mgbaOnline?.isGuest?.()) return;
   const seat = window.mgbaOnline.assignedPlayer?.();
@@ -1370,16 +1372,23 @@ function onFrame(data) {
     const frame = pendingFrame;
     pendingFrame = null;
     if (!frame) return;
-    if (frame.jpeg instanceof HTMLImageElement) {
-      // Online guest, per-seat JPEG: one screen, drawn image-first.
+    if (frame.jpeg) {
+      // Online guest, per-seat JPEG: one screen, drawn image-first. The frame
+      // is either an HTMLImageElement (legacy) or an ImageBitmap (v3 raw
+      // frames); both have width/naturalWidth. Bitmaps own GPU memory, so
+      // close them once drawn (a pending newer frame may already be queued).
+      const img = frame.jpeg;
       const s = screens[0];
       if (s) {
-        if (s.canvas.width !== frame.jpeg.naturalWidth || s.canvas.height !== frame.jpeg.naturalHeight) {
-          s.canvas.width = frame.jpeg.naturalWidth;
-          s.canvas.height = frame.jpeg.naturalHeight;
+        const w = img.naturalWidth || img.width;
+        const h = img.naturalHeight || img.height;
+        if (s.canvas.width !== w || s.canvas.height !== h) {
+          s.canvas.width = w;
+          s.canvas.height = h;
           s.imgData = null;
         }
-        s.ctx.drawImage(frame.jpeg, 0, 0);
+        s.ctx.drawImage(img, 0, 0);
+        if (typeof img.close === 'function') img.close();
       }
       return;
     }
@@ -2635,8 +2644,11 @@ function pickRomBrowser() {
 
 async function exportSaveTauri(player) {
   const { save } = window.__TAURI__.dialog;
+  // The battery save is plain SRAM/flash bytes: mGBA names it .sav, RetroArch
+  // names the identical data .srm — accept both so per-core saves move in
+  // both directions without renaming (issue #2).
   const path = await save({
-    filters: [{ name: 'GBA Save', extensions: ['sav'] }],
+    filters: [{ name: 'GBA Save', extensions: ['sav', 'srm'] }],
     defaultPath: `player${player}.sav`,
   });
   if (path) {
@@ -2645,7 +2657,34 @@ async function exportSaveTauri(player) {
   }
 }
 
+// In-browser battery save: unlike the desktop socket path there is no HTTP
+// server to POST to (GitHub Pages answers 405 — issue #2), so when the WASM
+// engine is in charge we hand the bytes to the core directly (same core
+// vtable primitives as the desktop wrapper: savedataClone/savedataRestore).
+function wasmSaveApi() {
+  const M = wasmModule;
+  if (!M || !M._mgs_export_save || !M._mgs_save_ptr || !M._mgs_import_save) return null;
+  return M;
+}
+
 async function exportSaveBrowser(player) {
+  const M = wasmSaveApi();
+  if (M) {
+    const size = M._mgs_export_save(player - 1);
+    if (!size) {
+      setStatus('Error: no save data (game has no battery-backed save?)');
+      return;
+    }
+    const bytes = M.HEAPU8.slice(M._mgs_save_ptr(), M._mgs_save_ptr() + size);
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `player${player}.sav`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setStatus(`Downloaded player ${player} save`);
+    return;
+  }
   const resp = await fetch(`/save/${player}`);
   if (!resp.ok) {
     setStatus('Error: ' + (await resp.text()));
@@ -2664,7 +2703,9 @@ async function importSaveTauri(player) {
   const { open } = window.__TAURI__.dialog;
   const selected = await open({
     multiple: false,
-    filters: [{ name: 'GBA Save', extensions: ['sav'] }],
+    // Battery saves carry the same bytes under several names (.sav, RetroArch
+    // .srm) — see issue #2.
+    filters: [{ name: 'GBA Save', extensions: ['sav', 'srm'] }],
   });
   if (selected) {
     await invoke('import_save', { player, path: selected });
@@ -2675,10 +2716,29 @@ async function importSaveTauri(player) {
 function importSaveBrowser(player) {
   const input = document.createElement('input');
   input.type = 'file';
-  input.accept = '.sav';
+  // .sav (mGBA) and .srm (RetroArch core saves) are byte-identical for GBA
+  // games; .sa1-.sa4 are mGBA's per-slot variants of the same data.
+  input.accept = '.sav,.srm,.sa1,.sa2,.sa3,.sa4';
   input.onchange = async () => {
     const file = input.files[0];
     if (!file) return;
+    const M = wasmSaveApi();
+    if (M) {
+      const blob = new Uint8Array(await file.arrayBuffer());
+      const ptr = M._malloc(blob.length);
+      try {
+        M.HEAPU8.set(blob, ptr);
+        const rc = M._mgs_import_save(player - 1, ptr, blob.length);
+        if (rc === 0) {
+          setStatus(`Imported ${file.name} into player ${player}`);
+        } else {
+          setStatus(`Error: could not load ${file.name} into player ${player} (rc ${rc})`);
+        }
+      } finally {
+        M._free(ptr);
+      }
+      return;
+    }
     const resp = await fetch(`/save/${player}`, { method: 'POST', body: file });
     setStatus(resp.ok ? `Imported save into player ${player}` : 'Error: ' + (await resp.text()));
   };

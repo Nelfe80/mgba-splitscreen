@@ -8,7 +8,166 @@
 
 ---
 
-## 2026-09-30 (6, latest) — the app's 4 view modes ported into the core as live per-viewer options; submission path pivots to GitLab CI
+## 2026-10-19 (1) — Online video v3: dedicated unreliable DataChannel + drop-stale frames
+
+**Verdict: shipped and wire-verified with a live 2-tab host/guest session on
+localhost; the dedicated channel confirms (`videoChannels()` → `unreliable:
+true`), guests decode via createImageBitmap with seq-based stale drops, and
+the whole control path (hello/welcome/input) stayed intact. WASM rebuilt with
+emcc 6.0.8 (~/emsdk) — mgba-splitscreen-web.{js,wasm} in web/ carry v3. NOT
+committed/pushed yet.**
+
+What changed (`src/online.js`, `src/main.js`, `src/sw.js` → CACHE v9):
+- **Dedicated video transport is its OWN RTCPeerConnection, not a second
+  DataChannel inside PeerJS's connection.** Both attempts to bolt an
+  `ordered:false, maxRetransmits:0` channel onto the PeerJS-managed pc wedged
+  one direction of the control channel in turn: (a) host-side create at 'open'
+  (mid-association renegotiation) killed guest→host messages (input +
+  the video-ready confirm never arrived); (b) guest-side create synchronously
+  at `peer.connect()` (rides the initial offer, no renegotiation) killed
+  HOST→GUEST control (welcome never processed, PeerJS's own channel even
+  reports `closed`; its dc label is `dc_<random>`, not 'peerjs', so label
+  matching isn't PeerJS's model either). Fix shape: PeerJS keeps driving
+  its ONE reliable channel (hello/welcome/input/audio); the host starts a
+  separate `RTCPeerConnection` (STUN-only), creates 'mgs-video' on it, and
+  offers/answers/trickles ICE over the control channel
+  (`video-offer`/`video-answer`/`video-ice`). Each side fails independently:
+  if video negotiation fails, frames keep flowing over the reliable channel
+  (protocol-1-compatible fallbacks on BOTH paths).
+- **Host side**: per-seat OffscreenCanvas + `convertToBlob` (async, no
+  toDataURL/base64/atob round trip) → `blob.arrayBuffer()` → one send with a
+  16-byte header ('FRA1' magic, u32 seq, u16 w/h, u8 quality tier). Sender
+  drop-stale: while `dc.bufferedAmount > 64KB` the frame is skipped entirely
+  (the guest would discard it for a newer one anyway); quality ladder
+  0.55→0.45→0.35 climbs back only after 12 consecutive empty-buffer sends
+  (`state.videoDropped`, reported only host-side for now).
+- **Guest side**: frames parse the header, keep ONE pending decode slot,
+  drop anything with seq ≤ deliveredSeq (mod-2^32 wrap-safe compare), and
+  decode with `createImageBitmap` (object-URL Image fallback for browsers
+  without it). main.js blits `frame.jpeg` whether it's an HTMLImageElement
+  (legacy) or an ImageBitmap (v3) using `naturalWidth || width` and CLOSES
+  the bitmap after drawing.
+- **Legacy-frame fallback path now carries seq too** (`{type:'frame'…, seq}`)
+  so the newest-wins rule works across a mid-session channel loss.
+- **Probes**: `mgbaOnline.videoStats()` gained `dropped`; new
+  `mgbaOnline.videoChannels()` reports per-guest `{unreliable: bool}` for
+  debugging live sessions.
+- **SW CACHE bumped to v9.** During the bring-up every iteration hit the
+  shell-cache staleness wall: scripts served from the previous worker's
+  cache-first shell hid the new code (and at one point a warm v8 cache hid
+  the main.js ImageBitmap branch, which made a working pipeline look like a
+  dead one). Cheap full reset: unregister the SW and reload; see the
+  debugging trail below.
+
+Wire verification trail (temporary console probes, all removed again):
+1. v3 dc created with correct options ({ordered:false, maxRetransmits:0}) but
+   guest never confirmed → found the root cause by console logs + an A/B
+   `window.__noVideoChannel` flag (with channel creation disabled, input
+   arrived: `rcv: [hello, input]`; with it enabled it didn't).
+2. Raw-dc probe (`conn.dataChannel.onmessage` wrap) on the pre-offer attempt:
+   PeerJS's channel label was `dc_7hora3jalis` and state `closed` with
+   `raw: []` — the welcome never reached the dc, proving guest-side inbound
+   control dies with an extra channel in the offer.
+3. Separate-PC architecture: `rcv: [hello, video-answer, …]`, dc open on both
+   ends, `videoChannels() → [{unreliable:true}]`, input delivery working.
+4. Blit check without a ROM: host injected a moving red-bar provider via
+   `mgbaOnline.broadcastFrame(img, 1)`; the guest canvas showed the bar at
+   the right position and it moved between samples (earlier black-canvas
+   readings were the no-ROM black frame, with one stale-main.js confounder
+   from the SW cache, see above).
+
+Open items: follow the to-do stream-top of 2026-10-19 (2): a real 2-tab ROM
+playtest (needs the human + a battery-save ROM) to measure end-to-end latency
+vs the v2 numbers (~8-9KB/frame @30fps), and peer-failure-path hardening
+(video peer 'failed' state → host currently falls back silently; consider a
+status line when it does).
+
+---
+
+## 2026-10-19 (2) — Issue #2 addressed: web save import/export without a server + .srm accepted
+
+**Verdict: fixed in code; WASM rebuilt with the new battery-save exports;
+local checks green through the JS path (no ROM on the test rig, so the
+round-trip against a real battery save still needs the human rig). Not
+committed/pushed yet.**
+
+j-be's report (two parts, both addressed):
+1. **Only `.sav` accepted** → the import dialog (desktop and browser) accepts
+   `.sav,.srm,.sa1-.sa4`; the desktop Tauri dialog filters gained 'srm'.
+   RetroArch's per-core `.srm` for GBA games is byte-identical SRAM (the
+   reporter proved it by renaming), so no format conversion is needed.
+2. **405 Not Allowed when importing on the web version** → the browser path
+   POSTed `/save/<player>` to the Pages static host (405). New C exports in
+   `web/mgba_splitscreen_web.c` (`mgs_export_save`/`mgs_save_ptr`/
+   `mgs_import_save`, mirroring gba.rs's `savedataClone`/
+   `savedataRestore` primitives, with a copied buffer for
+   ownership-safe restore) exported via build.sh's
+   EXPORTED_FUNCTIONS; `main.js` feature-detects them (`wasmSaveApi()`):
+   - WASM engine present (the always-case on GitHub Pages): import reads the
+     file into HEAPU8, calls `_mgs_import_save`, reports rc-specific status;
+     export clones the battery via `_mgs_export_save` + `_mgs_save_ptr`.
+   - Old wasm artifact (before this commit is deployed) or desktop socket
+     mode: falls back to the previous HTTP endpoints, so Tauri keeps working
+     unchanged.
+   With a fresh engine there is NO server dependency at all: export/import
+   works on any static host.
+- Verification: rebuilt the module with the emsdk at ~/emsdk (emcc 6.0.8,
+  `bash mgba-splitscreen/web/build.sh`); `typeof M._mgs_export_save ===
+  'function'` on a live page; `_mgs_export_save(0)` with no ROM returns 0
+  without crashing; message-level 405 no longer reachable on the wasm path.
+  The engine-side round-trip test (import a real .srm/.sav, confirm the game
+  reads it) needs the human rig (same as the v3 video retest). UX note for
+  the reply: on GitHub Pages the import must happen AFTER the ROM has booted
+  (the save must restore into a running instance; the desktop app autoloads
+  the save next to the ROM, the web build has no filesystem to scan).
+
+---
+
+**Verdict: the maintainer-side "not something we can distribute in its current
+state, as it runs in a browser runtime that requires the system to have it
+installed already" does NOT match the code. Deep audit, then a clarifying reply
+posted on the merged libretro-super#2127
+(comment 6154022473):**
+
+- Core-only includes: every file in src/platform/libretro-splitscreen includes
+  only mGBA headers + a vendored libretro.h. CMake target = mGBA CORE_SRC +
+  splitscreen/*.c, MINIMAL_CORE=2/__LIBRETRO__/DISABLE_THREADING. No app, web,
+  wasm, scripts or tools files in the compiled set (checked the generated
+  build.make source list).
+- Proof by build: fresh tree /tmp/lrsp-audit configured + built with the exact
+  recipe flags -DLIBMGBA_ONLY=ON -DBUILD_LIBRETRO_SPLITSCREEN=ON → rc=0,
+  mgba_splitscreen_libretro.so produced; `ldd` resolves ONLY libm + libc (vdso
+  aside); 25 retro_* symbols exported.
+- Distribution state re-checked live (2026-10-13): info.zip DOES list
+  mgba_splitscreen_libretro.info (19:00 pack) → lists in Core Downloader;
+  nightly .so.zip still 404; git.libretro.com project search still finds only
+  libretro/mgba → mirror/crawl still not done. Emscripten + webOS targets in
+  .gitlab-ci.yml (inherited from libretro/mgba) are the only browser-adjacent
+  lines in the repo; offered to drop them if that's what triggered the concern.
+- PR reply asks (1) for the concrete file/target behind the "browser runtime"
+  concern and (2) for the GitLab mirror/crawl addition. Watch the PR for the
+  maintainer answer; no code change made pending it.
+
+---
+
+## 2026-10-05 — PRs MERGED: core LISTS in RetroArch's Core Downloader, binary not yet downloadable
+
+**Verdict: the "included in the latest build" email = both PRs merged 2026-10-04
+(libretro/docs#1214 08:35 UTC, libretro/libretro-super#2127 08:36 UTC). The
+`mgba_splitscreen_libretro.info` is LIVE in the buildbot info pack
+(assets/frontend/info.zip), so after "Online Updater → Update Core Info Files"
+the core appears in Core Downloader. NOT YET DOWNLOADABLE:
+nightly/linux/x86_64/latest/mgba_splitscreen_libretro.so.zip → 404 (URL pattern
+sanity-checked against mgba_libretro.so.zip → 200), and no Spuds0588/
+mgba-splitscreen mirror exists on git.libretro.com (project search finds only
+libretro/mgba), so the GitLab CI has nothing to build. Remaining tail: the
+maintainer-side mirror/crawl action → CI build → binary lands in nightlies.
+If no mirror within a few days, ping hizzlekizzle on the merged PR / Discord
+thread.
+
+---
+
+## 2026-09-30 (6) — the app's 4 view modes ported into the core as live per-viewer options; submission path pivots to GitLab CI
 
 **Verdict: view parity with the desktop app is IN THE CORE and pixel-verified;
 the updater path is GitLab CI reading the core repo's own .gitlab-ci.yml (the
@@ -2575,3 +2734,51 @@ Harness now asserts audio health: per-video-frame average within [500,
 1200] (covers both rates), output on >=90% of played frames, batches <=
 2048. Result against the installed binary: 1091 frames/frame (FS boots at
 65536), 178/179 frames with output, max batch 1128. Both scenarios PASS.
+
+### 2026-10-01 (7) — MKSC 4P "spontaneous restart" narrowed to a frontend-ordered teardown; boot-menu double-load bug found & fixed
+
+**Verdict: the restart was NOT a core crash or watchdog. The SIO evidence
+proves a full lockstep teardown — which only retro_reset or
+retro_unload_game can produce — and a verbose capture caught a real bug
+on the way: every boot-menu start built the 4-core manager TWICE. Both
+fixed and pushed (bb617b054, b66511a35 → fs-link-loosen-timing +
+master).**
+
+- Low-pass default flipped to ON (user-validated: "it definitely
+  helped") in all three places (v2 def, legacy string, _readOptions
+  fallback) and pushed.
+- **Double-load bug**: retro_load_game armed BOTH the boot menu and the
+  deferred pendingLoad; the menu-take path called _doLoad directly and
+  never cleared pendingLoad, so the next retro_run built the whole
+  manager a second time. Found in the verbose capture as two
+  consecutive "loaded 4 player linked" lines with no reload between.
+  Fix: clear pendingLoad on the menu take; sp_load also deinits a live
+  manager before its memset (was a guaranteed 4-core leak on any
+  re-load). Menu harness still PASSes; single "link attached" now.
+- **Incident log decoded** (/tmp/ra_fs4p.log): mGBA log-level 1 =
+  SIO_EV_DETACH. 12 DETACH enqueues / 3 "no players" warnings = exactly
+  3 teardowns = 2 incidents + normal quit. Pattern per teardown: first
+  DETACH at its own timestamp, three DETACHes at an IDENTICAL timestamp,
+  all logged "from 0" — consistent with seats deiniting in a burst with
+  _reconfigPlayers renumbering survivors (last man standing becomes id
+  0). DETACH only originates from _removePlayer, reached via explicit
+  GBASIOLockstepCoordinatorDetach (= sp_reset) or driver deinit during
+  core teardown. Zero livelock/STALL/assert lines anywhere.
+- **One-tile start screen theory**: a reset alone boots straight into
+  the game (no menu), but an unload+reload re-arms the boot menu and
+  waits for P1 to press A — a session that drops to the menu can look
+  exactly like "one session at the start screen". Candidates for the
+  trigger: RetroArch disk-content change, savestate state-load (forces
+  unload+reload on a non-deterministic core), or netplay sync. STILL
+  UNKNOWN which; the stdout-only incident log could never show it (0
+  core log lines — core logs were routed to RA's suppressed logger).
+- **Named-path logging added**: retro_reset logs "frontend requested
+  RESET", retro_unload_game logs "frontend requested UNLOAD". The next
+  repro names its trigger in /tmp/ra_debug.log (fresh -v capture running
+  on the fixed core, PID-checked).
+- Open user question: HOW the 4P session was created (boot menu /
+  subsystem load / RetroArch netplay). "Restart happened later than
+  joining" fits a netplay sync or state-load mid-session far better than
+  a load-time trigger.
+- Evidence preserved: /tmp/ra_debug_bootstudy.log (verbose boot study
+  with the double-load), /tmp/ra_fs4p.log (incident run).

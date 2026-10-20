@@ -696,6 +696,76 @@ int mgs_load_state_bytes(int player, const uint8_t* data, size_t size) {
 	return g_players[player].core->loadState(g_players[player].core, data) ? 0 : -3;
 }
 
+/* Battery save (SRAM/flash) import/export, straight from the core — the same
+ * primitives the desktop wrapper uses (gba.rs export_save/import_save: core
+ * vtable savedataClone/savedataRestore). Returned bytes are a raw .sav file
+ * (RetroArch's per-core .srm for GBA games is byte-identical data). Buffer is
+ * owned here like the save-state global: capture returns the size, the next
+ * pointer read for export is fetched via mgs_save_ptr(). */
+static uint8_t* g_savbuf = NULL;
+static size_t g_savbuf_size = 0;
+
+EMSCRIPTEN_KEEPALIVE
+size_t mgs_export_save(int player) {
+	free(g_savbuf);
+	g_savbuf = NULL;
+	g_savbuf_size = 0;
+	if (player < 0 || player >= g_count || !g_players[player].running) {
+		return 0;
+	}
+	struct Player* p = &g_players[player];
+	if (!p->core->savedataClone) {
+		return 0;
+	}
+	void* sram = NULL;
+	size_t sz = p->core->savedataClone(p->core, &sram);
+	if (sz == 0 || !sram) {
+		return 0;
+	}
+	g_savbuf = malloc(sz);
+	if (!g_savbuf) {
+		free(sram);
+		return 0;
+	}
+	memcpy(g_savbuf, sram, sz);
+	free(sram);
+	g_savbuf_size = sz;
+	return sz;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* mgs_save_ptr(void) {
+	return g_savbuf;
+}
+
+/* Feed raw .sav/.srm battery bytes into one player. Snapped against the
+ * core's type-tagged savedata, so RetroArch .srm and mGBA .sav both load.
+ * Returns 0 on success (same rc convention as mgs_load_state_bytes). */
+EMSCRIPTEN_KEEPALIVE
+int mgs_import_save(int player, const uint8_t* data, size_t size) {
+	if (player < 0 || player >= g_count || !g_players[player].running) {
+		return -2;
+	}
+	if (!data || size == 0) {
+		return -1;
+	}
+	struct Player* p = &g_players[player];
+	if (!p->core->savedataRestore) {
+		return -3;
+	}
+	/* Copy first: savedataRestore may load a save whose next-of-kin owns the
+	 * buffer (JS keeps its own copy either way, but a copy makes ownership
+	 * unambiguous and matches the desktop path's file-backed semantics). */
+	uint8_t* copy = malloc(size);
+	if (!copy) {
+		return -4;
+	}
+	memcpy(copy, data, size);
+	int ok = p->core->savedataRestore(p->core, copy, size, 1);
+	free(copy);
+	return ok ? 0 : -5;
+}
+
 /* After a state-set import, the lockstep coordinator's per-player event
  * queues and asleep flags come back with the restored cores (mid-link saves
  * carry them in the driver state), and if they're left in place the games

@@ -3,6 +3,39 @@
 > Ordered by priority within each section. **Aggressively append results to
 > `history.md` as you work** so the next session can pick up mid-thought.
 
+## 🟢 2026-10-19 — Online video v3 (raw unreliable frames) + issue #2 save fix
+
+- [x] **v3 raw-frame transport SHIPPED + wire-verified** (details:
+      history.md 2026-10-19 (1)): dedicated UNRELIABLE UNORDERED DataChannel on
+      its OWN RTCPeerConnection (offer/answer/ICE over the PeerJS control
+      channel — do NOT bolt channels onto PeerJS's managed pc, it wedges one
+      direction of control either way, both attempts documented), host-side
+      OffscreenCanvas+Blob JPEG encode with backlog skips + quality ladder,
+      guest-side createImageBitmap decode with seq-based stale drops,
+      `createImageBitmap`-capable blit in main.js, protocol-1 fallbacks on
+      both paths, `sw.js` CACHE → v9. `videoChannels()` probe added.
+- [ ] **HUMAN RETEST (v3)**: two tabs, load a battery-save ROM — this is the
+      first latency-relevant playtest since v2 — play ~1-2 min, report feel +
+      `mgbaOnline.videoStats()` ({fps, dropped}) and `videoChannels()` from
+      the host console. Then commit/push so Pages picks it up (SW v9 forces
+      tester refreshes). Suggested commit: v3 video + issue #2 as two commits
+      (transport, then save import) since the WASM rebuild carries the
+      battery-save exports.
+- [x] **Issue #2 addressed in code** (details: history.md 2026-10-19 (2)):
+      `.srm` accepted beside `.sav` (desktop dialog + browser accept), and
+      the web version imports/exports battery saves through the WASM engine
+      itself (`mgs_export_save`/`mgs_save_ptr`/`mgs_import_save` C exports,
+      rebuilt WASM committed-ready in web/) instead of POSTing to a static
+      host (j-be's 405). Same core primitives as the desktop wrapper.
+- [ ] **Issue #2 wrap-up (human)**: commit + deploy the rebuilt WASM to
+      Pages, then reply to j-be (drafted under history.md 2026-10-19 (2)):
+      thanks, .srm now accepted without renaming, the 405 was the attempted
+      POST of a save to the app's local HTTP server — static hosting doesn't
+      support that
+      — the web build now moves saves through the engine, no server needed:
+      load ROM first, Saves → Import Save P*n*, pick the .srm. The fix lands
+      on Pages with the next deploy.
+
 ## 🔴 2026-09-30 — RetroArch core: view modes live + upstream path to production
 
 - [x] **All 4 app view modes in the core as live per-viewer options (pass 6,
@@ -17,6 +50,18 @@
       the human re-cycled views on the fixed build): MKSC 2P window, flip all
       layouts + focused player + overlays toggle, confirm aspect holds and no
       link stalls. Evidence shots to docs/screens/.
+- [ ] **MKSC 4P "spontaneous restart" mystery — instrumented, awaiting repro
+      (2026-10-01)**: the incident log proves a full SIO teardown (DETACH storm
+      → "Reconfiguring player IDs with no players attached") which only
+      retro_reset / retro_unload_game can produce — NOT a core crash or
+      watchdog. Side-find: boot-menu starts built the manager TWICE (fixed,
+      b66511a35). retro_reset / retro_unload_game now log "frontend requested
+      RESET/UNLOAD", so the next repro names its trigger in /tmp/ra_debug.log
+      (-v capture running on the fixed core). Also record HOW the 4P session
+      was created: boot menu / subsystem load / RetroArch netplay — a netplay
+      sync or savestate state-load forces unload+reload on a non-deterministic
+      core and fits "restart happened later than joining". Details:
+      history.md 2026-10-01 (7).
 - [x] **HUMAN-REPORTED + FIXED round 2 (2026-10-01): Core Options empty in
       real RetroArch** — root cause: the v2 options struct was sent from
       retro_set_environment BEFORE _initOptionDefs() filled the value lists
@@ -78,8 +123,20 @@
       produced garbled audio without it — the user's "audio sounds a bit
       garbled" report on the test build). Kept, matching upstream behavior;
       fork-diff catalog row updated to "in sync".
-- [ ] After review feedback: adjust recipes/info per maintainer preference
-      (platforms, core name); watch libretro-super#2127 + libretro/docs#1214.
+- [x] **MERGED (2026-10-04):** libretro-super#2127 (08:36 UTC) +
+      libretro/docs#1214 (08:35 UTC). `mgba_splitscreen_libretro.info` is LIVE
+      in the buildbot info pack (buildbot.libretro.com/assets/frontend/
+      info.zip) — the core now LISTS in RetroArch's Core Downloader after
+      "Update Core Info Files".
+- [ ] **WAITING ON: buildbot binary / GitLab mirror (maintainer side).**
+      nightly/linux/x86_64/latest/mgba_splitscreen_libretro.so.zip → 404 and
+      git.libretro.com has no Spuds0588/mgba-splitscreen mirror (search finds
+      only libretro/mgba), so CI has nothing to build yet; downloads from the
+      Core Downloader will fail until the mirror + crawl happens. Watch the
+      URL (re-check `curl -sI ...mgba_splitscreen_libretro.so.zip`); ping
+      hizzlekizzle on the merged PR / Discord thread if no mirror within a few
+      days. Recipe/info adjustments (platforms, core name) remain open per
+      maintainer preference.
 
 ## 🔴 2026-09-30 — RetroArch core: MKSC 2P proof + reset-crash fix (superseded details)
 

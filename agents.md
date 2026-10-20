@@ -55,6 +55,23 @@ renamed, and does not need to be). Older notes and the on-disk save-state
 magics still say "DualBoy"/`DUALSTATE` — those are historical or binary-format
 compatibility, not live branding.
 
+## North star for engineering decisions
+
+**Compatibility, playability, and stability — at the lowest minimum hardware
+requirements possible. Accuracy is explicitly NOT the goal** (owner direction,
+2026-09-29). Apply it whenever a trade-off shows up:
+
+- Prefer pragmatic HLE over faithful-but-heavy paths (e.g. single-card sessions
+  will HLE the multiboot *receiver* instead of requiring a real 16 KiB BIOS —
+  see to-do.md's single-card section).
+- Never raise the floor: no newly required files (BIOS/firmware), no feature
+  that only fits machines with extra RAM, threads, or cores.
+- "Stable on a low-end Android TV" is the working bar — per-player memory,
+  allocation churn, and main-thread stalls are first-class design constraints,
+  not after-the-fact cleanups.
+- Accuracy work is still welcome, but only in service of compatibility or
+  fixing real game breakage.
+
 ## Where things live
 
 - `mgba-splitscreen/src-tauri/src/gba.rs` — `GbaInstance`: wraps one `mCore` (init,
@@ -86,6 +103,11 @@ compatibility, not live branding.
 - `mgba-splitscreen/JOIN_CODES.md` — implementation-ready spec for 6-digit
   online join codes (cross-platform play). Build from this when picking up
   that to-do; no engine changes needed.
+- `mgba-splitscreen/RETROARCH_CORE.md` — implementation-ready spec for a
+  splitscreen libretro core (feasibility + phases + submission process).
+  Model: TGB Dual's N-emulators-in-one-core + `retro_load_game_special`
+  subsystem; build target `src/platform/libretro-splitscreen/` (new dir —
+  upstream's `src/platform/libretro/` stays untouched).
 - `Test Roms/` — owner's legal ROMs (gitignored). Four Swords is
   `Legend of Zelda, The - A Link To The Past Four Swords (U) [!].gba`.
 - `PROJECT_LOG.md` — full chronological project log (the long-form history).
@@ -150,6 +172,48 @@ file manager. Verified end to end on the android-36 `android-tv` image: installs
 in the TV launcher with its banner, boots the engine, and runs Four Swords in two linked
 cores (`?rom=` served from the host with CORS).
 
+## Repo & dev-env hygiene (clean up or it balloons)
+
+This repo can quietly grow past **16 GB** of regenerable build output — a
+2026-09-30 sweep took it from 16G → ~280M with nothing tracked touched.
+**Run a hygiene pass at the end of any session that built things** (and
+before benchmarking, so numbers come from a fresh build):
+
+```bash
+du -sh . mgba-splitscreen/src-tauri/target 2>/dev/null   # spot-check bloat
+# Safe-to-delete sweep — every path below is gitignored and regenerable:
+rm -rf mgba-splitscreen/src-tauri/target \
+       mgba-splitscreen/src-tauri/gen/android/app/build \
+       build-wasm build-libretro-sp \
+       mgba-splitscreen/src/tmp-test mgba-splitscreen/tmp_repro \
+       mgba-splitscreen/src/fs_rom.gba mgba-splitscreen/src/fs_state.dualbystate \
+       mgba-splitscreen/src/mgba-splitscreen-web.wasm \
+       mgba-splitscreen/src/mgba-splitscreen-web.js \
+       mgba-splitscreen/node_modules \
+       .freebuff/preview-*.log
+```
+
+- `src-tauri/target/` is the whale (~15 GB: cargo artifacts, stale android
+  triple dirs, `bundle/` installers). Delete freely; next `cargo build
+  --release` takes minutes. Same for `gen/android/app/build` (gradle) and the
+  cmake trees `build-wasm/` / `build-libretro-sp/`.
+- Everything above is rebuilt by: `cargo build --release`, `web/build.sh`
+  (drops the wasm/js back into `mgba-splitscreen/src/` for local previews),
+  `tools/build.sh`, `npx tauri android build`, `npm install`.
+- **Never delete:** `Test Roms/` (owner's legal ROMs), `cinema/` (tracked
+  test suite), `src-tauri/gen/android` (tracked — `tauri android` needs it;
+  only its `app/build/` subdir is disposable), `.freebuff/pylibs`,
+  `.freebuff/pages-staging`, `.freebuff/drive.py` (session tooling incl. the
+  GitHub Pages staging area).
+- Stray emulator runtime files (`*.sav`, `*.sa[0-9]`, `*.mgsstate`,
+  `*.dualbystate`, `*.ss0`, `*.log`) are gitignored everywhere — sweep them
+  when doing housekeeping (`git clean -Xn` lists all ignored files if in
+  doubt). DEBUG-level SIO logging generates GB-scale logs per run; don't turn
+  it on for full sessions.
+- Out-of-repo caches (`~/.gradle` ~1.6G, `~/.npm` ~2.1G,
+  `~/.cargo/registry` ~0.5G) only matter for global disk pressure, not repo
+  size — trim only if the user asks, since they cost rebuild time.
+
 ## Key gotchas
 
 - **ROM load order**: `core->init()` BEFORE `mCorePreloadFile()` (else
@@ -195,3 +259,17 @@ cores (`?rom=` served from the host with CORS).
 - Remaining: decide the final patch shape (strip the now-uneeded assist stack
   vs keep it gated as a host-armed 4P safety net), revert TEMP traces in
   io.c/sio.c, verify 4P. See history.md 2026-09-08 (late) entry + to-do.md.
+
+## WATCH: upstream PR feedback (2026-09-30)
+
+Two open PRs await maintainer review — check `gh pr view 2127 --repo
+libretro/libretro-super --json comments` and `gh pr view 1214 --repo
+libretro/docs --json comments` at session start, and answer review asks
+promptly (platform trims, naming, recipe changes are the likely asks; draft
+replies before pushing). The path to the online updater is libretro's GitLab
+CI reading this repo's `.gitlab-ci.yml` — a maintainer must add
+Spuds0588/mgba-splitscreen to the GitLab mirror/crawl list (ask posted on
+#2127; Discord #programming follow-up drafted in mgba-splitscreen/RETROARCH_CORE.md).
+Once mirrored, verify a green buildbot run produces mgba_splitscreen_libretro
+artifacts. NOTE: this agents.md edit sits atop another session's uncommitted
+changes — commit owners should take the file as-is.

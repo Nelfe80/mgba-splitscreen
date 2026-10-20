@@ -55,7 +55,8 @@ The same session in **Speaker** view — one screen big, the other three still l
 ![Four Swords in Speaker view](docs/screens/four-swords-speaker-view.png)
 
 **Mario Kart: Super Circuit — a live 4-player VS race** over the virtual link cable
-(single-card Multi-Pak play: three of the screens booted from the host's transfer):
+(all four units run their own copy of the cart; true single-card play — guests
+booting from the host's transfer — is a planned feature, see the roadmap):
 
 | | |
 |---|---|
@@ -68,7 +69,8 @@ keeps playing no matter how the screens are arranged:
 |---|---|
 | ![Mario Kart race in Speaker view](docs/screens/mario-kart-race-speaker.png) | ![Mario Kart race in Overlay/PiP view](docs/screens/mario-kart-race-overlay.png) |
 
-**Kirby & The Amazing Mirror — 4-Kirby co-op** (single-card GBA multiplayer): the game
+**Kirby & The Amazing Mirror — 4-Kirby co-op** (multiplayer-mode co-op; each unit
+runs its own copy of the cart): the game
 boots its "ADVENTURE WITH 4 KIRBYS!" banner on the linked session and each player gets
 their own screen into the shared hub world:
 
@@ -111,6 +113,10 @@ both inside the Tauri desktop app and in a plain web browser.
   game library (game → players → start).
 - **Virtual link cable**: instances stay in perfect, drop-free synchronization via mGBA's
   lockstep link-cable support — trade and battle across instances just like real hardware.
+- **Not yet: single-card (Multi-Pak) play** — one cart transmitting the multiplayer
+  program to the other units over the cable, so guests need no copy. Today every unit
+  boots its own copy of the ROM and multiplayer goes through each game's link-menu
+  mode; single-card is a committed roadmap feature (see [`to-do.md`](to-do.md)).
 - **Game library launcher** (**File → Games Library**): Recent games (persisted) plus ROM
   folders you add, with box art (local sibling images or an online fallback) and
   controller/keyboard navigation.

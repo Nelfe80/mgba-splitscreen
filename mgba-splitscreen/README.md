@@ -64,7 +64,10 @@ The UI is mouse-driven (a top menu bar), so game keys never fight the UI. Player
 
 ## Saves
 
-- **Saves → Export/Import Save P*n*** — one instance's `.sav` (mGBA-compatible).
+- **Saves → Export/Import Save P*n*** — one instance's battery save as `.sav`
+  (mGBA-compatible). Import also takes RetroArch's `.srm` (byte-identical
+  data) without renaming. In the browser build the save moves through the
+  engine itself — no server involved — so it works on GitHub Pages.
 - **File → Export/Import All Saves…** — a single `.dualbysave` bundle of every
   instance's save, so a party can be moved between machines.
 
