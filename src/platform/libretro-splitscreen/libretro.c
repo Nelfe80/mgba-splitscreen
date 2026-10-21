@@ -60,6 +60,7 @@ static bool fsAssistOpt = false;
 static bool overlaysOpt = true;
 static bool lowPassOpt = false;  /* audio post: single-pole low-pass */
 static bool limiterOpt = true;   /* audio post: soft-knee limiter */
+static bool bootMenuOpt = true;  /* off: no player-count menu, sessions built at load (netplay) */
 static unsigned advertisedRate; /* audio rate last sent via SET_SYSTEM_AV_INFO */
 static bool coreOptionsChanged; /* option visibility changed since last poll */
 
@@ -125,6 +126,9 @@ static struct retro_core_option_v2_definition _optionDefs[] = {
 	  NULL, NULL, { { NULL, NULL } }, "off" },
 	{ "splitscreen_overlays", "Player outlines & badges", NULL,
 	  "Colored border and P-number tag on each player's screen (like the app).",
+	  NULL, NULL, { { NULL, NULL } }, "on" },
+	{ "splitscreen_boot_menu", "Player-count boot menu", NULL,
+	  "Off: build 'Players per ROM' sessions at load, no menu. Required for netplay: the state must exist at load and every peer must start with the same sessions.",
 	  NULL, NULL, { { NULL, NULL } }, "on" },
 	{ NULL, NULL, NULL, NULL, NULL, NULL, { { NULL, NULL } }, NULL },
 };
@@ -213,6 +217,10 @@ static void _initOptionDefs(void) {
 	_setValues(&_optionDefs[3], valsAudio, 5);
 	_setValues(&_optionDefs[4], valsLowPass, 2);
 	_setValues(&_optionDefs[5], valsLimiter, 2);
+	static const struct retro_core_option_value valsBootMenu[] = {
+		{ "on", "On" }, { "off", "Off" },
+	};
+	_setValues(&_optionDefs[8], valsBootMenu, 2);
 	_setValues(&_optionDefs[6], valsAssist, 2);
 	_setValues(&_optionDefs[7], valsOverlays, 2);
 	_setLayoutValues(0);
@@ -341,6 +349,12 @@ static void _readOptions(void) {
 		else if (strcmp(var.value, "player 3") == 0) audioOpt = SP_AUDIO_P3;
 		else if (strcmp(var.value, "player 4") == 0) audioOpt = SP_AUDIO_P4;
 		else if (strcmp(var.value, "mixed") == 0) audioOpt = SP_AUDIO_MIX;
+	}
+
+	var.key = "splitscreen_boot_menu";
+	bootMenuOpt = true;
+	if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+		bootMenuOpt = strcmp(var.value, "off") != 0;
 	}
 
 	var.key = "splitscreen_players";
@@ -749,6 +763,13 @@ bool retro_load_game(const struct retro_game_info* game) {
 	/* Quick path: N copies of this one ROM. The count is chosen on the boot
 	 * menu (defaulting to the persisted option) instead of requiring a trip
 	 * to Core Options on every load. */
+	if (!bootMenuOpt) {
+		/* Netplay: sessions exist at load, so retro_serialize_size is known before the first frame. */
+		pendingPlayers = playersOpt;
+		pendingLoad = false;
+		menuActive = false;
+		return _doLoad(pendingPlayers, romCopy, romCopySize, havePath ? romPath : NULL);
+	}
 	pendingPlayers = 2;
 	pendingLoad = true;
 	menuActive = true;
