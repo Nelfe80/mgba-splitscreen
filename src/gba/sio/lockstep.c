@@ -368,6 +368,11 @@ static bool GBASIOLockstepDriverLoadState(struct GBASIODriver* driver, const voi
 	player->otherModes[1] = _modeIntToEnum(GBASIOLockstepSerializedFlagsGetPlayer1Mode(flags));
 	player->otherModes[2] = _modeIntToEnum(GBASIOLockstepSerializedFlagsGetPlayer2Mode(flags));
 	player->otherModes[3] = _modeIntToEnum(GBASIOLockstepSerializedFlagsGetPlayer3Mode(flags));
+	// The ready lines (SIOCNT ready, RCNT SD) follow from the modes just
+	// restored. The I/O restore set them from this player's view of the link
+	// before the load: in a new process (or after a reset) they came back low
+	// and the games dropped the link ("communication error").
+	_setReady(coordinator, player, player->playerId, player->mode);
 
 	if (GBASIOLockstepSerializedFlagsGetEventScheduled(flags)) {
 		int32_t when;
