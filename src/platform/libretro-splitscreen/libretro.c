@@ -414,6 +414,10 @@ static void _readOptions(void) {
 #define SP_MAX_W 480
 #define SP_MAX_H 480  /* speaker view: 2x focused (320) + 1x strip (160) */
 static unsigned baseWidth, baseHeight; /* geometry the aspect was built from */
+/* True while retro_load_game runs. SET_SYSTEM_AV_INFO is only valid from retro_run: sent during the load (the
+ * boot-menu-off path builds the sessions there), RetroArch created a window before its own and left it blank.
+ * The frontend reads the geometry from retro_get_system_av_info right after the load anyway. */
+static bool insideLoadGame;
 
 static void _applyGeometry(void) {
 	int n = sp.nPlayers ? sp.nPlayers : pendingPlayers;
@@ -464,7 +468,9 @@ static void _applyGeometry(void) {
 		info.geometry.aspect_ratio = wantW / (double) wantH;
 		info.geometry.max_width = SP_MAX_W;
 		info.geometry.max_height = SP_MAX_H;
-		environCallback(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
+		if (!insideLoadGame) {
+			environCallback(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
+		}
 		lastWidth = wantW;
 		lastHeight = wantH;
 		baseWidth = wantW;
@@ -806,7 +812,10 @@ bool retro_load_game(const struct retro_game_info* game) {
 		pendingPlayers = playersOpt;
 		pendingLoad = false;
 		menuActive = false;
-		return _doLoad(pendingPlayers, romCopy, romCopySize, havePath ? romPath : NULL);
+		insideLoadGame = true;
+		bool loaded = _doLoad(pendingPlayers, romCopy, romCopySize, havePath ? romPath : NULL);
+		insideLoadGame = false;
+		return loaded;
 	}
 	pendingPlayers = 2;
 	pendingLoad = true;
