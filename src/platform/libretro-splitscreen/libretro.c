@@ -89,6 +89,16 @@ static const int keymap[] = {
 #define SP_MEMORY_P3 0x101
 #define SP_MEMORY_P4 0x102
 
+static void _spMgbaLog(struct mLogger* logger, int category, enum mLogLevel level, const char* format, va_list args) {
+	UNUSED(logger);
+	if (!logCallback || !(level & (mLOG_FATAL | mLOG_ERROR))) {
+		return;
+	}
+	char message[256];
+	vsnprintf(message, sizeof(message), format, args);
+	logCallback(level == mLOG_FATAL ? RETRO_LOG_ERROR : RETRO_LOG_WARN, "[splitscreen] %s: %s\n", mLogCategoryName(category), message);
+}
+
 static void _spLogLine(const char* line) {
 	if (logCallback) {
 		logCallback(RETRO_LOG_INFO, "[splitscreen] %s\n", line);
@@ -657,9 +667,11 @@ void retro_init(void) {
 	vid.audio = SP_AUDIO_P1;
 	_initOptionDefs();
 
-	static struct mLogger logger; /* lives for the process: fine, global state allowed */
-	logger.log = 0;
-	(void) logger;
+	/* Without a default logger, mLog() falls back to printf for EVERY message at every level, debug included
+	 * (each DMA, BIOS call and SIO event, thousands per frame): with stdout captured by the launcher, two
+	 * linked consoles ran at a third of full speed. Only fatal and error messages reach the frontend log. */
+	static struct mLogger logger = { .log = _spMgbaLog };
+	mLogSetDefaultLogger(&logger);
 }
 
 void retro_deinit(void) {
