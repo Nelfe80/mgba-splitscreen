@@ -514,7 +514,7 @@ static void _geometryFromPlayers(int n) {
  * achievements and READ_CORE_RAM see an ordinary GBA; player N+1 is the same map 0xN0000000 higher.
  * Explicit ranges (select 0): no mirror of one player can alias another. */
 #define SP_PLAYER_MAP_STRIDE 0x10000000u
-static struct retro_memory_descriptor _spDescs[SP_MAX_PLAYERS * 2];
+static struct retro_memory_descriptor _spDescs[SP_MAX_PLAYERS * 2 + 1];
 
 static void _setupPlayerMaps(void) {
 	struct retro_memory_map mmaps;
@@ -535,6 +535,11 @@ static void _setupPlayerMaps(void) {
 		_spDescs[n].len = GBA_SIZE_IWRAM;
 		++n;
 	}
+	/* The lock table (struct sp_lock), written by the frontend before peers connect. */
+	_spDescs[n].ptr = sp.locks;
+	_spDescs[n].start = SP_LOCKS_BASE;
+	_spDescs[n].len = sizeof(sp.locks);
+	++n;
 	mmaps.descriptors = _spDescs;
 	mmaps.num_descriptors = n;
 	environCallback(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &mmaps);

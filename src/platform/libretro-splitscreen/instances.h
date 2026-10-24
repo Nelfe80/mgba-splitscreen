@@ -84,8 +84,22 @@ struct sp_player {
 	size_t saveSize;
 };
 
+/* NelfePlay: a byte held in one console's work RAM before every step (a cup the players may not
+ * change). The frontend writes the table through the core map (WRITE_CORE_MEMORY at SP_LOCKS_BASE)
+ * before netplay peers connect; it is part of the savestate, so a peer that joins holds the same
+ * values. address is a core map address (player N+1 at 0xN0000000, EWRAM or IWRAM). */
+#define SP_MAX_LOCKS 16
+#define SP_LOCKS_BASE 0x7F000000u
+struct sp_lock {
+	uint32_t address;
+	uint8_t value;
+	uint8_t active;
+	uint8_t reserved[2];
+};
+
 struct sp_manager {
 	struct sp_player players[SP_MAX_PLAYERS];
+	struct sp_lock locks[SP_MAX_LOCKS];
 	int nPlayers;
 	struct GBASIOLockstepCoordinator coordinator;
 	bool linkAttached;         /* true when nPlayers > 1 (link wired up) */

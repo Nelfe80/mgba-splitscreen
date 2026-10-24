@@ -306,6 +306,28 @@ void sp_reset(struct sp_manager* sp) {
 	_spLog("[splitscreen] %d players reset", sp->nPlayers);
 }
 
+/* NelfePlay locks: rewrite every active byte (see struct sp_lock). Out-of-range entries are skipped. */
+static void _applyLocks(struct sp_manager* sp) {
+	for (int k = 0; k < SP_MAX_LOCKS; ++k) {
+		const struct sp_lock* lock = &sp->locks[k];
+		if (!lock->active) {
+			continue;
+		}
+		int player = (int) (lock->address >> 28);
+		uint32_t local = lock->address & 0x0FFFFFFFu;
+		if (player >= sp->nPlayers || !sp->players[player].core
+		    || sp->players[player].core->platform(sp->players[player].core) != mPLATFORM_GBA) {
+			continue;
+		}
+		struct GBA* gba = sp->players[player].core->board;
+		if (local >= GBA_BASE_EWRAM && local < GBA_BASE_EWRAM + GBA_SIZE_EWRAM) {
+			((uint8_t*) gba->memory.wram)[local - GBA_BASE_EWRAM] = lock->value;
+		} else if (local >= GBA_BASE_IWRAM && local < GBA_BASE_IWRAM + GBA_SIZE_IWRAM) {
+			((uint8_t*) gba->memory.iwram)[local - GBA_BASE_IWRAM] = lock->value;
+		}
+	}
+}
+
 /* ---- Frame loop (port of the Rust cooperative stepping) ---- */
 
 bool sp_run_frame(struct sp_manager* sp, void (*poll)(void),
@@ -342,6 +364,7 @@ bool sp_run_frame(struct sp_manager* sp, void (*poll)(void),
 				continue;
 			}
 			progress = true;
+			_applyLocks(sp);
 			int32_t before = mTimingCurrentTime(p->core->timing);
 			p->core->runLoop(p->core);
 			int32_t delta = mTimingCurrentTime(p->core->timing) - before;
@@ -360,6 +383,8 @@ bool sp_run_frame(struct sp_manager* sp, void (*poll)(void),
 			}
 		}
 	}
+	/* The frontend reads RAM between frames: show it the held values. */
+	_applyLocks(sp);
 	if (steps >= SP_MAX_STEPS && progress) {
 		/* Livelock bailout: leave players on their last complete frames and
 		 * keep the frontend's audio thread alive (log-once would spam; the
@@ -846,7 +871,8 @@ size_t sp_audio(struct sp_manager* sp, enum spAudio source, int16_t* out, size_t
  * the per-player max. Sizes are fixed at load time so the total never grows. */
 
 #define SP_STATE_MAGIC 0x54535053u /* "SPST" little-endian */
-#define SP_STATE_VERSION 1
+#define SP_STATE_VERSION 2 /* 2: the lock table after the slices (NelfePlay); 1 still loads */
+#define SP_LOCKS_MAGIC 0x4B4C5053u /* "SPLK" */
 
 size_t sp_serialize_size(struct sp_manager* sp) {
 	/* Measure once per session: coordinator state is not independently
@@ -861,7 +887,7 @@ size_t sp_serialize_size(struct sp_manager* sp) {
 	}
 	/* Coordinator bookkeeping is small (a table + event queues); its content
 	 * is rebuilt on unserialize via a driver reset, see below. */
-	return total;
+	return total + sizeof(uint32_t) + sizeof(sp->locks);
 }
 
 bool sp_serialize(struct sp_manager* sp, void* data, size_t size) {
@@ -896,6 +922,16 @@ bool sp_serialize(struct sp_manager* sp, void* data, size_t size) {
 		}
 		vfm->close(vfm);
 	}
+	if (ok && offset + sizeof(uint32_t) + sizeof(sp->locks) > size) {
+		_spLog("serialize: no room for the lock table");
+		ok = false;
+	}
+	if (ok) {
+		uint32_t magic = SP_LOCKS_MAGIC;
+		memcpy((char*) data + offset, &magic, sizeof(magic));
+		memcpy((char*) data + offset + sizeof(magic), sp->locks, sizeof(sp->locks));
+		offset += sizeof(magic) + sizeof(sp->locks);
+	}
 	if (ok) {
 		/* Pad the remainder (size must never shrink between frames). */
 		memset((char*) data + offset, 0, size - offset);
@@ -912,7 +948,7 @@ bool sp_unserialize(struct sp_manager* sp, const void* data, size_t size) {
 		return false;
 	}
 	memcpy(header, data, sizeof(header));
-	if (header[0] != SP_STATE_MAGIC || header[1] != SP_STATE_VERSION ||
+	if (header[0] != SP_STATE_MAGIC || (header[1] != 1 && header[1] != SP_STATE_VERSION) ||
 	    (int) header[2] != sp->nPlayers) {
 		_spLog("unserialize: header mismatch (magic=%08x ver=%u n=%u want n=%d)",
 		       header[0], header[1], header[2], sp->nPlayers);
@@ -935,6 +971,19 @@ bool sp_unserialize(struct sp_manager* sp, const void* data, size_t size) {
 			return false;
 		}
 		offset += len;
+	}
+	/* A version 1 state has no locks: the values it was saved with are free. */
+	memset(sp->locks, 0, sizeof(sp->locks));
+	if (header[1] >= 2) {
+		uint32_t magic = 0;
+		if (offset + sizeof(magic) + sizeof(sp->locks) <= size) {
+			memcpy(&magic, (const char*) data + offset, sizeof(magic));
+		}
+		if (magic != SP_LOCKS_MAGIC) {
+			_spLog("unserialize: lock table missing at offset %zu", offset);
+			return false;
+		}
+		memcpy(sp->locks, (const char*) data + offset + sizeof(magic), sizeof(sp->locks));
 	}
 	/* NOTE: no coordinator reset here. The lockstep driver serializes its full
 	 * state through each core's savestate (player queues, cycle offsets, sleep
